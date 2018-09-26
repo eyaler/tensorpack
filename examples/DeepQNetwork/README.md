@@ -2,7 +2,7 @@
 
 [video demo](https://youtu.be/o21mddZtE5Y)
 
-Reproduce the following reinforcement learning methods:
+Reproduce (performance of) the following reinforcement learning methods:
 
 + Nature-DQN in:
 [Human-level Control Through Deep Reinforcement Learning](http://www.nature.com/nature/journal/v518/n7540/full/nature14236.html)
@@ -20,32 +20,39 @@ Claimed performance in the paper can be reproduced, on several games I've tested
 
 ![DQN](curve-breakout.png)
 
-On one TitanX, Double-DQN took 1 day of training to reach a score of 400 on breakout game.
-Batch-A3C implementation only took <2 hours.
+On one (Maxwell) TitanX, Double-DQN took ~18 hours of training to reach a score of 400 on breakout.
 
-Double-DQN with nature paper setting runs at 60 batches (3840 trained frames, 240 seen frames, 960 game frames) per second on (Maxwell) TitanX.
+Double-DQN with nature paper setting runs at 60 batches (3840 trained frames, 240 seen frames, 960 game frames) per second on TitanX.
 
 ## How to use
 
+### With ALE (paper's setting):
 Install [ALE](https://github.com/mgbellemare/Arcade-Learning-Environment) and gym.
 
-Download an [atari rom](https://github.com/openai/atari-py/tree/master/atari_py/atari_roms) to
-`$TENSORPACK_DATASET/atari_rom/` (defaults to ~/tensorpack_data/atari_rom/), e.g.:
+Download an [atari rom](https://github.com/openai/atari-py/tree/master/atari_py/atari_roms), e.g.:
 ```
-mkdir -p ~/tensorpack_data/atari_rom
-wget https://github.com/openai/atari-py/raw/master/atari_py/atari_roms/breakout.bin -O ~/tensorpack_data/atari_rom/breakout.bin
+wget https://github.com/openai/atari-py/raw/master/atari_py/atari_roms/breakout.bin
 ```
 
 Start Training:
 ```
-./DQN.py --rom breakout.bin
+./DQN.py --env breakout.bin
 # use `--algo` to select other DQN algorithms. See `-h` for more options.
 ```
 
 Watch the agent play:
 ```
-./DQN.py --rom breakout.bin --task play --load path/to/model
+# Download pretrained models or use one you trained:
+wget http://models.tensorpack.com/DeepQNetwork/DoubleDQN-Breakout.npz
+./DQN.py --env breakout.bin --task play --load DoubleDQN-Breakout.npz
 ```
-A pretrained model on breakout can be downloaded [here](https://drive.google.com/open?id=0B9IPQTvr2BBkN1Jrei1xWW0yR28).
+
+### With gym's Atari:
+
+Install gym and atari_py.
+
+```
+./DQN.py --env BreakoutDeterministic-v4
+```
 
 A3C code and models for Atari games in OpenAI Gym are released in [examples/A3C-Gym](../A3C-Gym)

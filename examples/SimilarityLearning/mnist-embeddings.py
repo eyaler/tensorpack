@@ -3,15 +3,12 @@
 # File: mnist-embeddings.py
 
 import numpy as np
-import os
-
 import argparse
 import tensorflow as tf
 import tensorflow.contrib.slim as slim
 
-os.environ['TENSORPACK_TRAIN_API'] = 'v2'   # will become default soon
+
 from tensorpack import *
-import tensorpack.tfutils.symbolic_functions as symbf
 from tensorpack.tfutils.summary import add_moving_summary
 from tensorpack.utils.gpu import change_gpu
 
@@ -19,7 +16,6 @@ from embedding_data import get_test_data, MnistPairs, MnistTriplets
 
 MATPLOTLIB_AVAIBLABLE = False
 try:
-    import matplotlib
     from matplotlib import offsetbox
     import matplotlib.pyplot as plt
     MATPLOTLIB_AVAIBLABLE = True
@@ -228,7 +224,7 @@ class EmbeddingModel(ModelDesc):
 
         return embeddings
 
-    def _get_optimizer(self):
+    def optimizer(self):
         lr = tf.get_variable('learning_rate', initializer=1e-4, trainable=False)
         return tf.train.GradientDescentOptimizer(lr)
 
@@ -240,40 +236,41 @@ class SiameseModel(EmbeddingModel):
         ds = BatchData(ds, 128 // 2)
         return ds
 
-    def _get_inputs(self):
-        return [InputDesc(tf.float32, (None, 28, 28), 'input'),
-                InputDesc(tf.float32, (None, 28, 28), 'input_y'),
-                InputDesc(tf.int32, (None,), 'label')]
+    def inputs(self):
+        return [tf.placeholder(tf.float32, (None, 28, 28), 'input'),
+                tf.placeholder(tf.float32, (None, 28, 28), 'input_y'),
+                tf.placeholder(tf.int32, (None,), 'label')]
 
-    def _build_graph(self, inputs):
-        # get inputs
-        x, y, label = inputs
+    def build_graph(self, x, y, label):
         # embed them
+        single_input = x
         x, y = self.embed([x, y])
 
         # tag the embedding of 'input' with name 'emb', just for inference later on
         with tf.variable_scope(tf.get_variable_scope(), reuse=True):
-            tf.identity(self.embed(inputs[0]), name="emb")
+            tf.identity(self.embed(single_input), name="emb")
 
         # compute the actual loss
         cost, pos_dist, neg_dist = contrastive_loss(x, y, label, 5., extra=True, scope="loss")
-        self.cost = tf.identity(cost, name="cost")
+        cost = tf.identity(cost, name="cost")
 
         # track these values during training
-        add_moving_summary(pos_dist, neg_dist, self.cost)
+        add_moving_summary(pos_dist, neg_dist, cost)
+        return cost
 
 
 class CosineModel(SiameseModel):
-    def _build_graph(self, inputs):
-        x, y, label = inputs
+    def build_graph(self, x, y, label):
+        single_input = x
         x, y = self.embed([x, y])
 
         with tf.variable_scope(tf.get_variable_scope(), reuse=True):
-            tf.identity(self.embed(inputs[0]), name="emb")
+            tf.identity(self.embed(single_input), name="emb")
 
         cost = siamese_cosine_loss(x, y, label, scope="loss")
-        self.cost = tf.identity(cost, name="cost")
-        add_moving_summary(self.cost)
+        cost = tf.identity(cost, name="cost")
+        add_moving_summary(cost)
+        return cost
 
 
 class TripletModel(EmbeddingModel):
@@ -283,25 +280,26 @@ class TripletModel(EmbeddingModel):
         ds = BatchData(ds, 128 // 3)
         return ds
 
-    def _get_inputs(self):
-        return [InputDesc(tf.float32, (None, 28, 28), 'input'),
-                InputDesc(tf.float32, (None, 28, 28), 'input_p'),
-                InputDesc(tf.float32, (None, 28, 28), 'input_n')]
+    def inputs(self):
+        return [tf.placeholder(tf.float32, (None, 28, 28), 'input'),
+                tf.placeholder(tf.float32, (None, 28, 28), 'input_p'),
+                tf.placeholder(tf.float32, (None, 28, 28), 'input_n')]
 
     def loss(self, a, p, n):
         return triplet_loss(a, p, n, 5., extra=True, scope="loss")
 
-    def _build_graph(self, inputs):
-        a, p, n = inputs
+    def build_graph(self, a, p, n):
+        single_input = a
         a, p, n = self.embed([a, p, n])
 
         with tf.variable_scope(tf.get_variable_scope(), reuse=True):
-            tf.identity(self.embed(inputs[0]), name="emb")
+            tf.identity(self.embed(single_input), name="emb")
 
         cost, pos_dist, neg_dist = self.loss(a, p, n)
 
-        self.cost = tf.identity(cost, name="cost")
-        add_moving_summary(pos_dist, neg_dist, self.cost)
+        cost = tf.identity(cost, name="cost")
+        add_moving_summary(pos_dist, neg_dist, cost)
+        return cost
 
 
 class SoftTripletModel(TripletModel):
@@ -316,19 +314,14 @@ class CenterModel(EmbeddingModel):
         ds = BatchData(ds, 128)
         return ds
 
-    def _get_inputs(self):
-        return [InputDesc(tf.float32, (None, 28, 28), 'input'),
-                InputDesc(tf.int32, (None,), 'label')]
+    def inputs(self):
+        return [tf.placeholder(tf.float32, (None, 28, 28), 'input'),
+                tf.placeholder(tf.int32, (None,), 'label')]
 
-    def _build_graph(self, inputs):
-        # get inputs
-        x, label = inputs
+    def build_graph(self, x, label):
         # embed them
         x = self.embed(x)
-
-        # tag the embedding of 'input' with name 'emb', just for inference later on
-        with tf.variable_scope(tf.get_variable_scope(), reuse=True):
-            tf.identity(self.embed(inputs[0]), name="emb")
+        x = tf.identity(x, name='emb')
 
         # compute the embedding loss
         emb_cost = center_loss(x, label, 10, 0.01)
@@ -337,10 +330,11 @@ class CenterModel(EmbeddingModel):
 
         cls_cost = tf.reduce_mean(tf.nn.sparse_softmax_cross_entropy_with_logits(logits=logits, labels=label),
                                   name='classification_costs')
-        self.cost = tf.add(emb_cost, 100 * cls_cost, name="cost")
+        total_cost = tf.add(emb_cost, 100 * cls_cost, name="cost")
 
         # track these values during training
-        add_moving_summary(self.cost, cls_cost, emb_cost)
+        add_moving_summary(total_cost, cls_cost, emb_cost)
+        return total_cost
 
 
 def get_config(model, algorithm_name):
@@ -385,7 +379,7 @@ def visualize(model_path, model, algo_name):
     ds = get_test_data()
     ds.reset_state()
 
-    for offset, dp in enumerate(ds.get_data()):
+    for offset, dp in enumerate(ds):
         digit, label = dp
         prediction = pred(digit)[0]
         embed[offset * BATCH_SIZE:offset * BATCH_SIZE + BATCH_SIZE, ...] = prediction

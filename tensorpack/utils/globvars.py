@@ -1,7 +1,6 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # File: globvars.py
-# Author: Yuxin Wu <ppwwyyxxc@gmail.com>
+
 
 import six
 import argparse
@@ -41,7 +40,7 @@ globalns = GlobalNS()
 """
 A namespace to store global variables.
 
-Examples:
+Example:
 
 .. code-block:: none
 

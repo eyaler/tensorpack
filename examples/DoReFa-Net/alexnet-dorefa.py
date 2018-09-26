@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# -*- coding: UTF-8 -*-
+# -*- coding: utf-8 -*-
 # File: alexnet-dorefa.py
 # Author: Yuxin Wu, Yuheng Zou ({wyx,zyh}@megvii.com)
 
@@ -7,20 +7,20 @@ import cv2
 import tensorflow as tf
 import argparse
 import numpy as np
-import multiprocessing
 import os
 import sys
 
-os.environ['TENSORPACK_TRAIN_API'] = 'v2'   # will become default soon
+
 from tensorpack import *
-from tensorpack.tfutils.symbolic_functions import *
-from tensorpack.tfutils.summary import *
+from tensorpack.tfutils.summary import add_param_summary
+from tensorpack.tfutils.sessinit import get_model_loader
 from tensorpack.tfutils.varreplace import remap_variables
 from tensorpack.dataflow import dataset
-from tensorpack.utils.gpu import get_nr_gpu
+from tensorpack.utils.gpu import get_num_gpu
 
-from imagenet_utils import get_imagenet_dataflow, fbresnet_augmentor
-from dorefa import get_dorefa
+from imagenet_utils import (
+    get_imagenet_dataflow, fbresnet_augmentor, ImageNetModel, eval_on_ILSVRC12)
+from dorefa import get_dorefa, ternarize
 
 """
 This is a tensorpack script for the ImageNet results in paper:
@@ -30,22 +30,7 @@ http://arxiv.org/abs/1606.06160
 The original experiements are performed on a proprietary framework.
 This is our attempt to reproduce it on tensorpack & TensorFlow.
 
-Accuracy:
-    Trained with 4 GPUs and (W,A,G)=(1,2,6), it can reach top-1 single-crop validation error of 47.6%,
-    after 70 epochs. This number is better than what's in the paper
-    due to more sophisticated augmentations.
-
-    With (W,A,G)=(32,32,32) -- full precision baseline, 41.4% error.
-    With (W,A,G)=(1,32,32) -- BWN, 44.3% error
-    With (W,A,G)=(1,2,6), 47.6% error
-    With (W,A,G)=(1,2,4), 58.4% error
-
-Speed:
-    About 11 iteration/s on 4 P100s. (Each epoch is set to 10000 iterations)
-    Note that this code was written early without using NCHW format. You
-    should expect a speed up if the code is ported to NCHW format.
-
-To Train, for example:
+To Train:
     ./alexnet-dorefa.py --dorefa 1,2,6 --data PATH --gpu 0,1
 
     PATH should look like:
@@ -63,30 +48,29 @@ To Train, for example:
         Fast disk random access (Not necessarily SSD. I used a RAID of HDD, but not sure if plain HDD is enough)
         More than 20 CPU cores (for data processing)
         More than 10G of free memory
+    On 8 P100s and dorefa==1,2,6, the training should take about 30 minutes per epoch.
 
-To Run Pretrained Model:
-    ./alexnet-dorefa.py --load alexnet-126.npy --run a.jpg --dorefa 1,2,6
+To run pretrained model:
+    ./alexnet-dorefa.py --load alexnet-126.npz --run a.jpg --dorefa 1,2,6
 """
 
 BITW = 1
 BITA = 2
 BITG = 6
-TOTAL_BATCH_SIZE = 128
+TOTAL_BATCH_SIZE = 256
 BATCH_SIZE = None
 
 
-class Model(ModelDesc):
-    def _get_inputs(self):
-        return [InputDesc(tf.float32, [None, 224, 224, 3], 'input'),
-                InputDesc(tf.int32, [None], 'label')]
+class Model(ImageNetModel):
+    weight_decay = 5e-6
+    weight_decay_pattern = 'fc.*/W'
 
-    def _build_graph(self, inputs):
-        image, label = inputs
-        image = image / 255.0
-
-        fw, fa, fg = get_dorefa(BITW, BITA, BITG)
-
-        old_get_variable = tf.get_variable
+    def get_logits(self, image):
+        if BITW == 't':
+            fw, fa, fg = get_dorefa(32, 32, 32)
+            fw = ternarize
+        else:
+            fw, fa, fg = get_dorefa(BITW, BITA, BITG)
 
         # monkey-patch tf.get_variable to apply fw
         def new_get_variable(v):
@@ -95,7 +79,7 @@ class Model(ModelDesc):
             if not name.endswith('W') or 'conv0' in name or 'fct' in name:
                 return v
             else:
-                logger.info("Binarizing weight {}".format(v.op.name))
+                logger.info("Quantizing weight {}".format(v.op.name))
                 return fw(v)
 
         def nonlin(x):
@@ -107,10 +91,11 @@ class Model(ModelDesc):
             return fa(nonlin(x))
 
         with remap_variables(new_get_variable), \
-                argscope(BatchNorm, decay=0.9, epsilon=1e-4), \
-                argscope([Conv2D, FullyConnected], use_bias=False, nl=tf.identity):
+                argscope([Conv2D, BatchNorm, MaxPooling], data_format='channels_first'), \
+                argscope(BatchNorm, momentum=0.9, epsilon=1e-4), \
+                argscope(Conv2D, use_bias=False):
             logits = (LinearWrap(image)
-                      .Conv2D('conv0', 96, 12, stride=4, padding='VALID')
+                      .Conv2D('conv0', 96, 12, strides=4, padding='VALID', use_bias=True)
                       .apply(activate)
                       .Conv2D('conv1', 256, 5, padding='SAME', split=2)
                       .apply(fg)
@@ -140,31 +125,17 @@ class Model(ModelDesc):
                       .BatchNorm('bnfc0')
                       .apply(activate)
 
-                      .FullyConnected('fc1', 4096)
+                      .FullyConnected('fc1', 4096, use_bias=False)
                       .apply(fg)
                       .BatchNorm('bnfc1')
                       .apply(nonlin)
                       .FullyConnected('fct', 1000, use_bias=True)())
-
-        prob = tf.nn.softmax(logits, name='output')
-
-        cost = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=logits, labels=label)
-        cost = tf.reduce_mean(cost, name='cross_entropy_loss')
-
-        wrong = prediction_incorrect(logits, label, 1, name='wrong-top1')
-        add_moving_summary(tf.reduce_mean(wrong, name='train-error-top1'))
-        wrong = prediction_incorrect(logits, label, 5, name='wrong-top5')
-        add_moving_summary(tf.reduce_mean(wrong, name='train-error-top5'))
-
-        # weight decay on all W of fc layers
-        wd_cost = regularize_cost('fc.*/W', l2_regularizer(5e-6), name='regularize_cost')
-
         add_param_summary(('.*/W', ['histogram', 'rms']))
-        self.cost = tf.add_n([cost, wd_cost], name='cost')
-        add_moving_summary(cost, wd_cost, self.cost)
+        tf.nn.softmax(logits, name='output')  # for prediction
+        return logits
 
-    def _get_optimizer(self):
-        lr = tf.get_variable('learning_rate', initializer=1e-4, trainable=False)
+    def optimizer(self):
+        lr = tf.get_variable('learning_rate', initializer=2e-4, trainable=False)
         return tf.train.AdamOptimizer(lr, epsilon=1e-5)
 
 
@@ -176,7 +147,6 @@ def get_data(dataset_name):
 
 
 def get_config():
-    logger.auto_set_dir()
     data_train = get_data('train')
     data_test = get_data('val')
 
@@ -184,17 +154,15 @@ def get_config():
         dataflow=data_train,
         callbacks=[
             ModelSaver(),
-            # HumanHyperParamSetter('learning_rate'),
             ScheduledHyperParamSetter(
-                'learning_rate', [(56, 2e-5), (64, 4e-6)]),
+                'learning_rate', [(60, 4e-5), (75, 8e-6)]),
             InferenceRunner(data_test,
-                            [ScalarStats('cost'),
-                             ClassificationError('wrong-top1', 'val-error-top1'),
+                            [ClassificationError('wrong-top1', 'val-error-top1'),
                              ClassificationError('wrong-top5', 'val-error-top5')])
         ],
         model=Model(),
-        steps_per_epoch=10000,
-        max_epoch=100,
+        steps_per_epoch=1280000 // TOTAL_BATCH_SIZE,
+        max_epoch=90,
     )
 
 
@@ -207,24 +175,11 @@ def run_image(model, sess_init, inputs):
     )
     predictor = OfflinePredictor(pred_config)
     meta = dataset.ILSVRCMeta()
-    pp_mean = meta.get_per_pixel_mean()
-    pp_mean_224 = pp_mean[16:-16, 16:-16, :]
     words = meta.get_synset_words_1000()
 
-    def resize_func(im):
-        h, w = im.shape[:2]
-        scale = 256.0 / min(h, w)
-        desSize = map(int, (max(224, min(w, scale * w)),
-                            max(224, min(h, scale * h))))
-        im = cv2.resize(im, tuple(desSize), interpolation=cv2.INTER_CUBIC)
-        return im
-    transformers = imgaug.AugmentorList([
-        imgaug.MapImage(resize_func),
-        imgaug.CenterCrop((224, 224)),
-        imgaug.MapImage(lambda x: x - pp_mean_224),
-    ])
+    transformers = imgaug.AugmentorList(fbresnet_augmentor(isTrain=False))
     for f in inputs:
-        assert os.path.isfile(f)
+        assert os.path.isfile(f), f
         img = cv2.imread(f).astype('float32')
         assert img is not None
 
@@ -241,28 +196,41 @@ def run_image(model, sess_init, inputs):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--gpu', help='the physical ids of GPUs to use')
-    parser.add_argument('--load', help='load a checkpoint, or a npy (given as the pretrained model)')
+    parser.add_argument('--load', help='load a checkpoint, or a npz (given as the pretrained model)')
     parser.add_argument('--data', help='ILSVRC dataset dir')
-    parser.add_argument('--dorefa',
-                        help='number of bits for W,A,G, separated by comma', required=True)
+    parser.add_argument('--dorefa', required=True,
+                        help='number of bits for W,A,G, separated by comma. W="t" means TTQ')
     parser.add_argument('--run', help='run on a list of images with the pretrained model', nargs='*')
+    parser.add_argument('--eval', action='store_true')
     args = parser.parse_args()
 
-    BITW, BITA, BITG = map(int, args.dorefa.split(','))
+    dorefa = args.dorefa.split(',')
+    if dorefa[0] == 't':
+        assert dorefa[1] == '32' and dorefa[2] == '32'
+        BITW, BITA, BITG = 't', 32, 32
+    else:
+        BITW, BITA, BITG = map(int, dorefa)
 
     if args.gpu:
         os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
 
     if args.run:
-        assert args.load.endswith('.npy')
-        run_image(Model(), DictRestore(np.load(args.load, encoding='latin1').item()), args.run)
+        assert args.load.endswith('.npz')
+        run_image(Model(), DictRestore(dict(np.load(args.load))), args.run)
+        sys.exit()
+    if args.eval:
+        BATCH_SIZE = 128
+        ds = get_data('val')
+        eval_on_ILSVRC12(Model(), get_model_loader(args.load), ds)
         sys.exit()
 
-    nr_tower = max(get_nr_gpu(), 1)
+    nr_tower = max(get_num_gpu(), 1)
     BATCH_SIZE = TOTAL_BATCH_SIZE // nr_tower
+    logger.set_logger_dir(os.path.join(
+        'train_log', 'alexnet-dorefa-{}'.format(args.dorefa)))
     logger.info("Batch per tower: {}".format(BATCH_SIZE))
 
     config = get_config()
     if args.load:
         config.session_init = SaverRestore(args.load)
-    launch_train_with_config(config, SyncMultiGPUTrainer(nr_tower))
+    launch_train_with_config(config, SyncMultiGPUTrainerReplicated(nr_tower))

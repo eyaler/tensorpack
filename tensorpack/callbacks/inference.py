@@ -1,6 +1,6 @@
-# -*- coding: UTF-8 -*-
+# -*- coding: utf-8 -*-
 # File: inference.py
-# Author: Yuxin Wu <ppwwyyxx@gmail.com>
+
 
 import numpy as np
 from abc import ABCMeta
@@ -9,7 +9,6 @@ from six.moves import zip
 
 from .base import Callback
 from ..utils import logger
-from ..utils.utils import execute_only_once
 from ..utils.stats import RatioCounter, BinaryStatistics
 from ..tfutils.common import get_op_tensor_name
 
@@ -55,16 +54,8 @@ class Inferencer(Callback):
         """
         Return a list of tensor names (guaranteed not op name) this inferencer needs.
         """
-        try:
-            ret = self._get_fetches()
-        except NotImplementedError:
-            logger.warn("Inferencer._get_output_tensors was deprecated and renamed to _get_fetches")
-            ret = self._get_output_tensors()
-
+        ret = self._get_fetches()
         return [get_op_tensor_name(n)[1] for n in ret]
-
-    def _get_output_tensors(self):
-        pass
 
     def _get_fetches(self):
         raise NotImplementedError()
@@ -77,15 +68,7 @@ class Inferencer(Callback):
             results(list): list of results this inferencer fetched. Has the same
                 length as ``self._get_fetches()``.
         """
-        try:
-            self._on_fetches(results)
-        except NotImplementedError:
-            if execute_only_once():
-                logger.warn("Inferencer._datapoint was deprecated and renamed to _on_fetches.")
-            self._datapoint(results)
-
-    def _datapoint(self, results):
-        pass
+        self._on_fetches(results)
 
     def _on_fetches(self, results):
         raise NotImplementedError()
@@ -95,6 +78,9 @@ class ScalarStats(Inferencer):
     """
     Statistics of some scalar tensor.
     The value will be averaged over all given datapoints.
+
+    Note that the average of accuracy over all batches is not necessarily the
+    accuracy of the whole dataset. See :class:`ClassificationError` for details.
     """
 
     def __init__(self, names, prefix='validation'):
@@ -120,8 +106,9 @@ class ScalarStats(Inferencer):
         self.stats.append(output)
 
     def _after_inference(self):
-        self.stats = np.mean(self.stats, axis=0)
-        assert len(self.stats) == len(self.names)
+        if len(self.stats):
+            self.stats = np.mean(self.stats, axis=0)
+            assert len(self.stats) == len(self.names)
 
         ret = {}
         for stat, name in zip(self.stats, self.names):
@@ -133,7 +120,7 @@ class ScalarStats(Inferencer):
 
 class ClassificationError(Inferencer):
     """
-    Compute __true__ classification error in batch mode, from a ``wrong`` tensor.
+    Compute **true** classification error in batch mode, from a ``wrong`` tensor.
 
     The ``wrong`` tensor is supposed to be an binary vector containing
     whether each sample in the batch is *incorrectly* classified.

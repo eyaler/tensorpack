@@ -1,22 +1,20 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # File: mnist-disturb.py
-# Author: Yuxin Wu <ppwwyyxxc@gmail.com>
 
-import numpy as np
 import os
-import sys
 import argparse
 
-os.environ['TENSORPACK_TRAIN_API'] = 'v2'   # will become default soon
+
 from tensorpack import *
+from tensorpack.utils import logger
 from tensorpack.dataflow import dataset
 import tensorflow as tf
 from disturb import DisturbLabel
 
 import imp
 mnist_example = imp.load_source('mnist_example',
-                                os.path.join(os.path.dirname(__file__), '..', 'mnist-convnet.py'))
+                                os.path.join(os.path.dirname(__file__), '..', 'basics', 'mnist-convnet.py'))
 get_config = mnist_example.get_config
 
 
@@ -27,25 +25,22 @@ def get_data():
 
 
 mnist_example.get_data = get_data
-IMAGE_SIZE = 28
 
 
 class Model(mnist_example.Model):
-    def _build_graph(self, inputs):
-        image, label = inputs
+    def build_graph(self, image, label):
         image = tf.expand_dims(image, 3)
 
-        with argscope(Conv2D, kernel_shape=5, nl=tf.nn.relu):
-            logits = (LinearWrap(image)  # the starting brace is only for line-breaking
-                      .Conv2D('conv0', out_channel=32, padding='VALID')
-                      .MaxPooling('pool0', 2)
-                      .Conv2D('conv1', out_channel=64, padding='VALID')
-                      .MaxPooling('pool1', 2)
-                      .FullyConnected('fc0', 512, nl=tf.nn.relu)
-                      .FullyConnected('fc1', out_dim=10, nl=tf.identity)())
-        prob = tf.nn.softmax(logits, name='prob')
+        logits = (LinearWrap(image)  # the starting brace is oactivationy for line-breaking
+                  .Conv2D('conv0', 32, 5, padding='VALID', activation=tf.nn.relu)
+                  .MaxPooling('pool0', 2)
+                  .Conv2D('conv1', 64, 5, padding='VALID', activation=tf.nn.relu)
+                  .MaxPooling('pool1', 2)
+                  .FullyConnected('fc0', 512, activation=tf.nn.relu)
+                  .FullyConnected('fc1', out_dim=10, activation=tf.identity)())
+        tf.nn.softmax(logits, name='prob')
 
-        wrong = symbolic_functions.prediction_incorrect(logits, label)
+        wrong = tf.cast(tf.logical_not(tf.nn.in_top_k(logits, label, 1)), tf.float32, name='incorrect_vector')
         add_moving_summary(tf.reduce_mean(wrong, name='train_error'))
 
         cost = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=logits, labels=label)
@@ -53,8 +48,7 @@ class Model(mnist_example.Model):
         wd_cost = tf.multiply(1e-5, regularize_cost('fc.*/W', tf.nn.l2_loss),
                               name='regularize_loss')
 
-        self.cost = tf.add_n([wd_cost, cost], name='cost')
-        add_moving_summary(cost, wd_cost, self.cost)
+        return tf.add_n([wd_cost, cost], name='cost')
 
 
 if __name__ == '__main__':
@@ -65,5 +59,6 @@ if __name__ == '__main__':
     if args.gpu:
         os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
 
+    logger.auto_set_dir()
     config = get_config()
     launch_train_with_config(config, SimpleTrainer())

@@ -1,22 +1,21 @@
 #!/usr/bin/env python
-# -*- coding: UTF-8 -*-
+# -*- coding: utf-8 -*-
 # File: hed.py
-# Author: Yuxin Wu <ppwwyyxxc@gmail.com>
+# Author: Yuxin Wu
 
 import cv2
 import tensorflow as tf
-import argparse
 import numpy as np
+import argparse
 from six.moves import zip
 import os
-import sys
 
-os.environ['TENSORPACK_TRAIN_API'] = 'v2'   # will become default soon
+
 from tensorpack import *
 from tensorpack.dataflow import dataset
-from tensorpack.utils.gpu import get_nr_gpu
-from tensorpack.tfutils import optimizer
-from tensorpack.tfutils.summary import *
+from tensorpack.utils.gpu import get_num_gpu
+from tensorpack.tfutils import optimizer, gradproc
+from tensorpack.tfutils.summary import add_moving_summary, add_param_summary
 
 
 def class_balanced_sigmoid_cross_entropy(logits, label, name='cross_entropy_loss'):
@@ -45,28 +44,80 @@ def class_balanced_sigmoid_cross_entropy(logits, label, name='cross_entropy_loss
     return tf.where(zero, 0.0, cost, name=name)
 
 
-class Model(ModelDesc):
-    def _get_inputs(self):
-        return [InputDesc(tf.float32, [None, None, None, 3], 'image'),
-                InputDesc(tf.int32, [None, None, None], 'edgemap')]
+@layer_register(log_shape=True)
+def CaffeBilinearUpSample(x, shape):
+    """
+    Deterministic bilinearly-upsample the input images.
+    It is implemented by deconvolution with "BilinearFiller" in Caffe.
+    It is aimed to mimic caffe behavior.
 
-    def _build_graph(self, inputs):
-        image, edgemap = inputs
+    Args:
+        x (tf.Tensor): a NHWC tensor
+        shape (int): the upsample factor
+
+    Returns:
+        tf.Tensor: a NHWC tensor.
+    """
+    inp_shape = x.shape.as_list()
+    ch = inp_shape[3]
+    assert ch is not None
+
+    shape = int(shape)
+    filter_shape = 2 * shape
+
+    def bilinear_conv_filler(s):
+        """
+        s: width, height of the conv filter
+        https://github.com/BVLC/caffe/blob/99bd99795dcdf0b1d3086a8d67ab1782a8a08383/include/caffe/filler.hpp#L219-L268
+        """
+        f = np.ceil(float(s) / 2)
+        c = float(2 * f - 1 - f % 2) / (2 * f)
+        ret = np.zeros((s, s), dtype='float32')
+        for x in range(s):
+            for y in range(s):
+                ret[x, y] = (1 - abs(x / f - c)) * (1 - abs(y / f - c))
+        return ret
+    w = bilinear_conv_filler(filter_shape)
+    w = np.repeat(w, ch * ch).reshape((filter_shape, filter_shape, ch, ch))
+
+    weight_var = tf.constant(w, tf.float32,
+                             shape=(filter_shape, filter_shape, ch, ch),
+                             name='bilinear_upsample_filter')
+    x = tf.pad(x, [[0, 0], [shape - 1, shape - 1], [shape - 1, shape - 1], [0, 0]], mode='SYMMETRIC')
+    out_shape = tf.shape(x) * tf.constant([1, shape, shape, 1], tf.int32)
+    deconv = tf.nn.conv2d_transpose(x, weight_var, out_shape,
+                                    [1, shape, shape, 1], 'SAME')
+    edge = shape * (shape - 1)
+    deconv = deconv[:, edge:-edge, edge:-edge, :]
+
+    if inp_shape[1]:
+        inp_shape[1] *= shape
+    if inp_shape[2]:
+        inp_shape[2] *= shape
+    deconv.set_shape(inp_shape)
+    return deconv
+
+
+class Model(ModelDesc):
+    def inputs(self):
+        return [tf.placeholder(tf.float32, [None, None, None, 3], 'image'),
+                tf.placeholder(tf.int32, [None, None, None], 'edgemap')]
+
+    def build_graph(self, image, edgemap):
         image = image - tf.constant([104, 116, 122], dtype='float32')
         edgemap = tf.expand_dims(edgemap, 3, name='edgemap4d')
 
         def branch(name, l, up):
-            with tf.variable_scope(name) as scope:
-                l = Conv2D('convfc', l, 1, kernel_shape=1, nl=tf.identity,
+            with tf.variable_scope(name):
+                l = Conv2D('convfc', l, 1, kernel_size=1, activation=tf.identity,
                            use_bias=True,
-                           W_init=tf.constant_initializer(),
-                           b_init=tf.constant_initializer())
+                           kernel_initializer=tf.constant_initializer())
                 while up != 1:
-                    l = BilinearUpSample('upsample{}'.format(up), l, 2)
+                    l = CaffeBilinearUpSample('upsample{}'.format(up), l, 2)
                     up = up / 2
                 return l
 
-        with argscope(Conv2D, kernel_shape=3, nl=tf.nn.relu):
+        with argscope(Conv2D, kernel_size=3, activation=tf.nn.relu):
             l = Conv2D('conv1_1', image, 64)
             l = Conv2D('conv1_2', l, 64)
             b1 = branch('branch1', l, 1)
@@ -95,9 +146,9 @@ class Model(ModelDesc):
             b5 = branch('branch5', l, 16)
 
         final_map = Conv2D('convfcweight',
-                           tf.concat([b1, b2, b3, b4, b5], 3), 1, 1,
-                           W_init=tf.constant_initializer(0.2),
-                           use_bias=False, nl=tf.identity)
+                           tf.concat([b1, b2, b3, b4, b5], 3), 1, kernel_size=1,
+                           kernel_initializer=tf.constant_initializer(0.2),
+                           use_bias=False, activation=tf.identity)
         costs = []
         for idx, b in enumerate([b1, b2, b3, b4, b5, final_map]):
             output = tf.nn.sigmoid(b, name='output{}'.format(idx + 1))
@@ -118,10 +169,11 @@ class Model(ModelDesc):
             costs.append(wd_cost)
 
             add_param_summary(('.*/W', ['histogram']))   # monitor W
-            self.cost = tf.add_n(costs, name='cost')
-            add_moving_summary(costs + [wrong, self.cost])
+            total_cost = tf.add_n(costs, name='cost')
+            add_moving_summary(wrong, total_cost, *costs)
+            return total_cost
 
-    def _get_optimizer(self):
+    def optimizer(self):
         lr = tf.get_variable('learning_rate', initializer=3e-5, trainable=False)
         opt = tf.train.AdamOptimizer(lr, epsilon=1e-3)
         return optimizer.apply_grad_processors(
@@ -185,7 +237,7 @@ def get_data(name):
 def view_data():
     ds = RepeatedData(get_data('train'), -1)
     ds.reset_state()
-    for ims, edgemaps in ds.get_data():
+    for ims, edgemaps in ds:
         for im, edgemap in zip(ims, edgemaps):
             assert im.shape[0] % 16 == 0 and im.shape[1] % 16 == 0, im.shape
             cv2.imshow("im", im / 255.0)
@@ -197,7 +249,7 @@ def view_data():
 def get_config():
     logger.auto_set_dir()
     dataset_train = get_data('train')
-    steps_per_epoch = dataset_train.size() * 40
+    steps_per_epoch = len(dataset_train) * 40
     dataset_val = get_data('val')
 
     return TrainConfig(
@@ -259,4 +311,4 @@ if __name__ == '__main__':
             config.session_init = get_model_loader(args.load)
         launch_train_with_config(
             config,
-            SyncMultiGPUTrainer(max(get_nr_gpu(), 1)))
+            SyncMultiGPUTrainer(max(get_num_gpu(), 1)))

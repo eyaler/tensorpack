@@ -1,53 +1,65 @@
-#!/usr/bin/env python
-# -*- coding: UTF-8 -*-
+# -*- coding: utf-8 -*-
 # File: fc.py
-# Author: Yuxin Wu <ppwwyyxx@gmail.com>
+
 
 import tensorflow as tf
+import numpy as np
 
-from .common import layer_register, rename_get_variable, VariableHolder
-from ..tfutils import symbolic_functions as symbf
+from .common import layer_register, VariableHolder
+from .tflayer import convert_to_tflayer_args, rename_get_variable
 
 __all__ = ['FullyConnected']
 
 
-@layer_register(log_shape=True)
-def FullyConnected(x, out_dim,
-                   W_init=None, b_init=None,
-                   nl=tf.identity, use_bias=True):
+def batch_flatten(x):
     """
-    Fully-Connected layer, takes a N>1D tensor and returns a 2D tensor.
-    It is an equivalent of `tf.layers.dense` except for naming conventions.
+    Flatten the tensor except the first dimension.
+    """
+    shape = x.get_shape().as_list()[1:]
+    if None not in shape:
+        return tf.reshape(x, [-1, int(np.prod(shape))])
+    return tf.reshape(x, tf.stack([tf.shape(x)[0], -1]))
 
-    Args:
-        x (tf.Tensor): a tensor to be flattened except for the first dimension.
-        out_dim (int): output dimension
-        W_init: initializer for W. Defaults to `variance_scaling_initializer`.
-        b_init: initializer for b. Defaults to zero.
-        nl: a nonlinearity function
-        use_bias (bool): whether to use bias.
 
-    Returns:
-        tf.Tensor: a NC tensor named ``output`` with attribute `variables`.
+@layer_register(log_shape=True)
+@convert_to_tflayer_args(
+    args_names=['units'],
+    name_mapping={'out_dim': 'units'})
+def FullyConnected(
+        inputs,
+        units,
+        activation=None,
+        use_bias=True,
+        kernel_initializer=tf.contrib.layers.variance_scaling_initializer(2.0),
+        bias_initializer=tf.zeros_initializer(),
+        kernel_regularizer=None,
+        bias_regularizer=None,
+        activity_regularizer=None):
+    """
+    A wrapper around `tf.layers.Dense`.
+    One difference to maintain backward-compatibility:
+    Default weight initializer is variance_scaling_initializer(2.0).
 
     Variable Names:
 
     * ``W``: weights of shape [in_dim, out_dim]
     * ``b``: bias
     """
-    x = symbf.batch_flatten(x)
 
-    if W_init is None:
-        W_init = tf.contrib.layers.variance_scaling_initializer()
-    if b_init is None:
-        b_init = tf.constant_initializer()
-
+    inputs = batch_flatten(inputs)
     with rename_get_variable({'kernel': 'W', 'bias': 'b'}):
         layer = tf.layers.Dense(
-            out_dim, activation=lambda x: nl(x, name='output'), use_bias=use_bias,
-            kernel_initializer=W_init, bias_initializer=b_init,
-            trainable=True)
-        ret = layer.apply(x, scope=tf.get_variable_scope())
+            units=units,
+            activation=activation,
+            use_bias=use_bias,
+            kernel_initializer=kernel_initializer,
+            bias_initializer=bias_initializer,
+            kernel_regularizer=kernel_regularizer,
+            bias_regularizer=bias_regularizer,
+            activity_regularizer=activity_regularizer,
+            _reuse=tf.get_variable_scope().reuse)
+        ret = layer.apply(inputs, scope=tf.get_variable_scope())
+        ret = tf.identity(ret, name='output')
 
     ret.variables = VariableHolder(W=layer.kernel)
     if use_bias:

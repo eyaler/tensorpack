@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # File: viz.py
 
@@ -8,23 +7,24 @@ import numpy as np
 from tensorpack.utils import viz
 from tensorpack.utils.palette import PALETTE_RGB
 
-from coco import COCOMeta
-from utils.box_ops import get_iou_callable
+from utils.np_box_ops import iou as np_iou
+from config import config as cfg
 
 
 def draw_annotation(img, boxes, klass, is_crowd=None):
+    """Will not modify img"""
     labels = []
     assert len(boxes) == len(klass)
     if is_crowd is not None:
         assert len(boxes) == len(is_crowd)
         for cls, crd in zip(klass, is_crowd):
-            clsname = COCOMeta.class_names[cls]
+            clsname = cfg.DATA.CLASS_NAMES[cls]
             if crd == 1:
                 clsname += ';Crowd'
             labels.append(clsname)
     else:
         for cls in klass:
-            labels.append(COCOMeta.class_names[cls])
+            labels.append(cfg.DATA.CLASS_NAMES[cls])
     img = viz.draw_boxes(img, boxes, labels)
     return img
 
@@ -37,8 +37,7 @@ def draw_proposal_recall(img, proposals, proposal_scores, gt_boxes):
         proposal_scores: NP
         gt_boxes: NG
     """
-    bbox_iou_float = get_iou_callable()
-    box_ious = bbox_iou_float(gt_boxes, proposals)    # ng x np
+    box_ious = np_iou(gt_boxes, proposals)    # ng x np
     box_ious_argsort = np.argsort(-box_ious, axis=1)
     good_proposals_ind = box_ious_argsort[:, :3]   # for each gt, find 3 best proposals
     good_proposals_ind = np.unique(good_proposals_ind.ravel())
@@ -59,23 +58,29 @@ def draw_predictions(img, boxes, scores):
         return img
     labels = scores.argmax(axis=1)
     scores = scores.max(axis=1)
-    tags = ["{},{:.2f}".format(COCOMeta.class_names[lb], score) for lb, score in zip(labels, scores)]
+    tags = ["{},{:.2f}".format(cfg.DATA.CLASS_NAMES[lb], score) for lb, score in zip(labels, scores)]
     return viz.draw_boxes(img, boxes, tags)
 
 
-def draw_final_outputs(img, final_boxes, final_probs, final_labels):
+def draw_final_outputs(img, results):
     """
     Args:
         results: [DetectionResult]
     """
-    if final_boxes.shape[0] == 0:
+    if len(results) == 0:
         return img
 
     tags = []
-    for prob, label in zip(final_probs, final_labels):
+    for r in results:
         tags.append(
-            "{},{:.2f}".format(COCOMeta.class_names[label], prob))
-    return viz.draw_boxes(img, final_boxes, tags)
+            "{},{:.2f}".format(cfg.DATA.CLASS_NAMES[r.class_id], r.score))
+    boxes = np.asarray([r.box for r in results])
+    ret = viz.draw_boxes(img, boxes, tags)
+
+    for r in results:
+        if r.mask is not None:
+            ret = draw_mask(ret, r.mask)
+    return ret
 
 
 def draw_mask(im, mask, alpha=0.5, color=None):

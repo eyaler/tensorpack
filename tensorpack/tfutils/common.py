@@ -1,11 +1,11 @@
-#!/usr/bin/env python
-# -*- coding: UTF-8 -*-
+# -*- coding: utf-8 -*-
 # File: common.py
-# Author: Yuxin Wu <ppwwyyxx@gmail.com>
+
 
 import tensorflow as tf
 from six.moves import map
 from ..utils.argtools import graph_memoized
+from ..utils.develop import deprecated
 
 __all__ = ['get_default_sess_config',
            'get_global_step_value',
@@ -13,17 +13,19 @@ __all__ = ['get_default_sess_config',
            # 'get_op_tensor_name',
            # 'get_tensors_by_names',
            # 'get_op_or_tensor_by_name',
-           # 'get_tf_version_number',
            ]
 
 
 def get_default_sess_config(mem_fraction=0.99):
     """
-    Return a better session config to use as default.
-    Tensorflow default session config consume too much resources.
+    Return a tf.ConfigProto to use as default session config.
+    You can modify the returned config to fit your needs.
 
     Args:
-        mem_fraction(float): fraction of memory to use.
+        mem_fraction(float): see the `per_process_gpu_memory_fraction` option
+        in TensorFlow's GPUOptions protobuf:
+        https://github.com/tensorflow/tensorflow/blob/master/tensorflow/core/protobuf/config.proto
+
     Returns:
         tf.ConfigProto: the config to use.
     """
@@ -32,21 +34,25 @@ def get_default_sess_config(mem_fraction=0.99):
     conf.allow_soft_placement = True
     # conf.log_device_placement = True
 
-    # https://github.com/tensorflow/tensorflow/issues/9322#issuecomment-295758107
-    # can speed up a bit
     conf.intra_op_parallelism_threads = 1
     conf.inter_op_parallelism_threads = 0
+    # TF benchmark use cpu_count() - gpu_thread_count(), e.g. 80 - 8 * 2
+    # Didn't see much difference.
 
     conf.gpu_options.per_process_gpu_memory_fraction = mem_fraction
-    if get_tf_version_number() >= 1.2:
-        conf.gpu_options.force_gpu_compatible = True
 
-    conf.gpu_options.allocator_type = 'BFC'
+    # This hurt performance of large data pipeline:
+    # https://github.com/tensorflow/benchmarks/commit/1528c46499cdcff669b5d7c006b7b971884ad0e6
+    # conf.gpu_options.force_gpu_compatible = True
+
     conf.gpu_options.allow_growth = True
 
-    # May hurt performance
+    # from tensorflow.core.protobuf import rewriter_config_pb2 as rwc
+    # conf.graph_options.rewrite_options.memory_optimization = \
+    #     rwc.RewriterConfig.HEURISTICS
+
+    # May hurt performance?
     # conf.graph_options.optimizer_options.global_jit_level = tf.OptimizerOptions.ON_1
-    # TODO test this
     # conf.graph_options.place_pruned_graph = True
     return conf
 
@@ -60,20 +66,18 @@ def get_global_step_var():
     """
     scope = tf.VariableScope(reuse=False, name='')  # the root vs
     with tf.variable_scope(scope):
-        if get_tf_version_number() <= 1.0:
-            var = tf.get_variable('global_step',
-                                  initializer=tf.constant(0, dtype=tf.int64),
-                                  trainable=False, dtype=tf.int64)
-            tf.add_to_collection(tf.GraphKeys.GLOBAL_STEP, var)
-        else:
-            var = tf.train.get_or_create_global_step()
+        var = tf.train.get_or_create_global_step()
     return var
 
 
 def get_global_step_value():
     """
     Returns:
-        int: global_step value in current graph and session"""
+        int: global_step value in current graph and session
+
+    Has to be called under a default session.
+    """
+
     return tf.train.global_step(
         tf.get_default_session(),
         get_global_step_var())
@@ -135,8 +139,13 @@ def get_op_or_tensor_by_name(name):
         return list(map(f, name))
 
 
+@deprecated("You should use get_tf_version_tuple instead due to the existence of TF 1.10")
 def get_tf_version_number():
-    """
-    Return a float (for comparison), indicating tensorflow version.
-    """
     return float('.'.join(tf.VERSION.split('.')[:2]))
+
+
+def get_tf_version_tuple():
+    """
+    Return TensorFlow version as a 2-element tuple (for comparison).
+    """
+    return tuple(map(int, tf.VERSION.split('.')[:2]))

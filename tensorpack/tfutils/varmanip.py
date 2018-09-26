@@ -1,7 +1,5 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # File: varmanip.py
-# Author: Yuxin Wu <ppwwyyxxc@gmail.com>
 
 import six
 import os
@@ -11,10 +9,8 @@ import numpy as np
 from ..utils import logger
 from .common import get_op_tensor_name
 
-__all__ = ['SessionUpdate', 'dump_session_params', 'dump_chkpt_vars',
-           'load_chkpt_vars',
-           # 'get_savename_from_varname', 'is_training_name',
-           'get_checkpoint_path']
+__all__ = ['SessionUpdate', 'dump_session_params',
+           'load_chkpt_vars', 'save_chkpt_vars', 'get_checkpoint_path']
 
 
 def get_savename_from_varname(
@@ -52,7 +48,7 @@ class SessionUpdate(object):
     @staticmethod
     def load_value_to_var(var, val, strict=False):
         """
-        Call `var.load(val)` with the default session.
+        Call `var.load(val)` with the default session, with some type checks.
 
         Args:
             var (tf.Variable):
@@ -86,7 +82,7 @@ class SessionUpdate(object):
             vartype = var.value().dtype
             if vartype != val.dtype:
                 msg = "Variable {} has dtype {} but was given a value of dtype {}.".format(name, vartype, val.dtype)
-                newtype = upcast(var.dtype, val.dtype)
+                newtype = upcast(var.dtype.base_dtype, val.dtype)
                 if newtype is not None:
                     val = newtype(val)
                     logger.warn(msg + " Load it after casting!")
@@ -113,11 +109,12 @@ class SessionUpdate(object):
 def dump_session_params(path):
     """
     Dump value of all TRAINABLE + MODEL variables to a dict, and save as
-    npy/npz format (loadable by :class:`DictRestore`).
+    npz format (loadable by :func:`sessinit.get_model_loader`).
 
     Args:
-        path(str): the file name to save the parameters. Must ends with npy or npz.
+        path(str): the file name to save the parameters. Must ends with npz.
     """
+    # save variables that are GLOBAL, and either TRAINABLE or MODEL
     var = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES)
     var.extend(tf.get_collection(tf.GraphKeys.MODEL_VARIABLES))
     # TODO dedup
@@ -127,15 +124,33 @@ def dump_session_params(path):
     result = {}
     for v in var:
         result[v.name] = v.eval()
+    save_chkpt_vars(result, path)
+
+
+def save_chkpt_vars(dic, path):
+    """
+    Save variables in dic to path.
+
+    Args:
+        dic: {name: value}
+        path: save as npz if the name ends with '.npz', otherwise save as a checkpoint.
+    """
     logger.info("Variables to save to {}:".format(path))
-    keys = sorted(list(result.keys()))
+    keys = sorted(list(dic.keys()))
     logger.info(pprint.pformat(keys))
-    if path.endswith('.npy'):
-        np.save(path, result)
-    elif path.endswith('.npz'):
-        np.savez_compressed(path, **result)
+
+    assert not path.endswith('.npy')
+    if path.endswith('.npz'):
+        np.savez_compressed(path, **dic)
     else:
-        raise ValueError("Don't know which format to use for {}".format(path))
+        with tf.Graph().as_default(), \
+                tf.Session() as sess:
+            for k, v in six.iteritems(dic):
+                k = get_op_tensor_name(k)[0]
+                _ = tf.Variable(name=k, initial_value=v)    # noqa
+            sess.run(tf.global_variables_initializer())
+            saver = tf.train.Saver()
+            saver.save(sess, path, write_meta_graph=False)
 
 
 def get_checkpoint_path(model_path):
@@ -161,7 +176,7 @@ def get_checkpoint_path(model_path):
     elif model_path.endswith('.index'):
         new_path = model_path.split('.index')[0]
     if new_path != model_path:
-        logger.warn(
+        logger.info(
             "Checkpoint path {} is auto-corrected to {}.".format(model_path, new_path))
         model_path = new_path
     assert tf.gfile.Exists(model_path) or tf.gfile.Exists(model_path + '.index'), model_path
@@ -169,7 +184,7 @@ def get_checkpoint_path(model_path):
 
 
 def load_chkpt_vars(model_path):
-    """ Dump all variables from a checkpoint to a dict.
+    """ Load all variables from a checkpoint to a dict.
 
     Args:
         model_path(str): path to a checkpoint.
@@ -184,11 +199,6 @@ def load_chkpt_vars(model_path):
     for n in var_names:
         result[n] = reader.get_tensor(n)
     return result
-
-
-def dump_chkpt_vars(model_path):
-    logger.warn("dump_chkpt_vars was renamed to load_chkpt_vars!")
-    return load_chkpt_vars(model_path)
 
 
 def is_training_name(name):
@@ -210,5 +220,9 @@ def is_training_name(name):
     if name.endswith('/Adagrad'):
         return True
     if name.startswith('EMA/'):  # all the moving average summaries
+        return True
+    if name.startswith('AccumGrad') or name.endswith('/AccumGrad'):
+        return True
+    if name.startswith('apply_gradients'):
         return True
     return False

@@ -1,13 +1,13 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # File: scope_utils.py
-# Author: Yuxin Wu <ppwwyyxxc@gmail.com>
+
 
 import tensorflow as tf
 import functools
 from contextlib import contextmanager
 
 from ..utils.argtools import graph_memoized
+from .common import get_tf_version_tuple
 
 __all__ = ['auto_reuse_variable_scope', 'cached_name_scope', 'under_name_scope']
 
@@ -17,7 +17,7 @@ def auto_reuse_variable_scope(func):
     A decorator which automatically reuses the current variable scope if the
     function has been called with the same variable scope before.
 
-    Examples:
+    Example:
 
     .. code-block:: python
 
@@ -39,8 +39,14 @@ def auto_reuse_variable_scope(func):
         h = hash((tf.get_default_graph(), scope.name))
         # print("Entering " + scope.name + " reuse: " + str(h in used_scope))
         if h in used_scope:
-            with tf.variable_scope(scope, reuse=True):
-                return func(*args, **kwargs)
+            if get_tf_version_tuple() >= (1, 5):
+                with tf.variable_scope(scope, reuse=True, auxiliary_name_scope=False):
+                    return func(*args, **kwargs)
+            else:
+                ns = tf.get_default_graph().get_name_scope()
+                with tf.variable_scope(scope, reuse=True), \
+                        tf.name_scope(ns + '/' if ns else ''):
+                    return func(*args, **kwargs)
         else:
             used_scope.add(h)
             return func(*args, **kwargs)
@@ -48,20 +54,30 @@ def auto_reuse_variable_scope(func):
     return wrapper
 
 
-def under_name_scope():
+def under_name_scope(name_scope=None):
     """
-    Returns:
-        A decorator which makes the function happen under a name scope,
-        which is named by the function itself.
+    Args:
+        name_scope(str): the default scope to use. If None, will use the name of the function.
 
-    Examples:
+    Returns:
+        A decorator which makes the function run under a name scope.
+        The name scope is obtained by the following:
+        1. The 'name_scope' keyword argument when the decorated function is called.
+        2. The 'name_scope' argument of the decorator.
+        3. (default) The name of the decorated function itself.
+
+    Example:
 
     .. code-block:: python
 
         @under_name_scope()
         def rms(x):
-            return tf.sqrt(  # will be under name scope 'rms'
+            return tf.sqrt(
                 tf.reduce_mean(tf.square(x)))
+
+        rms(tensor)  # will be called under name scope 'rms'
+        rms(tensor, name_scope='scope')  # will be called under name scope 'scope'
+
 
     Todo:
         Add a reuse option.
@@ -70,8 +86,40 @@ def under_name_scope():
     def _impl(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
+            scopename = kwargs.pop('name_scope', name_scope)
+            if scopename is None:
+                scopename = func.__name__
+
+            with tf.name_scope(scopename):
+                return func(*args, **kwargs)
+        return wrapper
+    return _impl
+
+
+def under_variable_scope():
+    """
+    Returns:
+        A decorator which makes the function happen under a variable scope,
+        which is named by the function itself.
+
+    Example:
+
+    .. code-block:: python
+
+        @under_variable_scope()
+        def mid_level(x):
+            with argscope(Conv2D, kernel_shape=3, nl=BNReLU):
+                x = Conv2D('conv1', x, 512, stride=1)
+                x = Conv2D('conv2', x, 256, stride=1)
+            return x
+
+    """
+
+    def _impl(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
             name = func.__name__
-            with tf.name_scope(name):
+            with tf.variable_scope(name):
                 return func(*args, **kwargs)
         return wrapper
     return _impl
@@ -85,15 +133,19 @@ def _get_cached_ns(name):
 
 
 @contextmanager
-def cached_name_scope(name):
+def cached_name_scope(name, top_level=True):
     """
-    Return a context which either opens and caches a new top-level name scope,
+    Return a context which either opens and caches a new name scope,
     or reenter an existing one.
 
-    Note:
-        The name scope will always be top-level. It will not be nested under
-        any existing name scope of the caller.
+    Args:
+        top_level(bool): if True, the name scope will always be top-level.
+            It will not be nested under any existing name scope of the caller.
     """
+    if not top_level:
+        current_ns = tf.get_default_graph().get_name_scope()
+        if current_ns:
+            name = current_ns + '/' + name
     ns = _get_cached_ns(name)
     with tf.name_scope(ns):
         yield ns

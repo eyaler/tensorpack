@@ -1,7 +1,6 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # File: prof.py
-# Author: Yuxin Wu <ppwwyyxxc@gmail.com>
+
 
 import os
 import numpy as np
@@ -13,8 +12,9 @@ from tensorflow.python.client import timeline
 
 from .base import Callback
 from ..utils import logger
-from ..utils.concurrency import ensure_proc_terminate, subproc_call
-from ..utils.gpu import get_nr_gpu
+from ..utils.concurrency import ensure_proc_terminate, start_proc_mask_signal
+from ..utils.gpu import get_num_gpu
+from ..utils.nvml import NVMLContext
 
 __all__ = ['GPUUtilizationTracker', 'GraphProfiler', 'PeakMemoryTracker']
 
@@ -25,32 +25,32 @@ class GPUUtilizationTracker(Callback):
     It will start a process to run `nvidia-smi` every second
     within the epoch (the trigger_epoch time was not included),
     and write average utilization to monitors.
+
+    This callback creates a process, therefore it's not safe to be used with MPI.
     """
+
+    _chief_only = False
 
     def __init__(self, devices=None):
         """
         Args:
             devices (list[int]): physical GPU ids. If None, will use CUDA_VISIBLE_DEVICES
         """
+        assert os.name != 'nt', "GPUUtilizationTracker does not support windows!"
         if devices is None:
             env = os.environ.get('CUDA_VISIBLE_DEVICES')
             if env is None:
+                self._devices = list(range(get_num_gpu()))
                 logger.warn("[GPUUtilizationTracker] Both devices and CUDA_VISIBLE_DEVICES are None! "
-                            "Will monitor all visible GPUs!")
-                self._devices = list(map(str, range(get_nr_gpu())))
+                            "Will monitor all {} visible GPUs!".format(len(self._devices)))
             else:
                 if len(env):
-                    self._devices = env.split(',')
+                    self._devices = list(map(int, env.split(',')))
                 else:
                     self._devices = []
         else:
-            self._devices = list(map(str, devices))
+            self._devices = devices
         assert len(self._devices), "[GPUUtilizationTracker] No GPU device given!"
-
-        self._command = "nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits -i " + \
-            ','.join(self._devices)
-        _, ret = subproc_call(self._command)
-        assert ret == 0, "Cannot fetch GPU utilization!"
 
     def _before_train(self):
         self._evt = mp.Event()
@@ -59,7 +59,7 @@ class GPUUtilizationTracker(Callback):
         self._proc = mp.Process(target=self.worker, args=(
             self._evt, self._queue, self._stop_evt))
         ensure_proc_terminate(self._proc)
-        self._proc.start()
+        start_proc_mask_signal(self._proc)
 
     def _before_epoch(self):
         self._evt.set()
@@ -68,6 +68,10 @@ class GPUUtilizationTracker(Callback):
         while self._evt.is_set():   # unlikely
             pass
         self._evt.set()
+
+    def _trigger_epoch(self):
+        # Don't do this in after_epoch because
+        # before,after_epoch are supposed to be extremely fast by design.
         stats = self._queue.get()
         for idx, dev in enumerate(self._devices):
             self.trainer.monitors.put_scalar('GPUUtil/{}'.format(dev), stats[idx])
@@ -86,20 +90,24 @@ class GPUUtilizationTracker(Callback):
 
             stats = np.zeros((len(self._devices),), dtype='f4')
             cnt = 0
-            while True:
-                time.sleep(1)
-                output, retv = subproc_call(self._command)
-                assert retv == 0, "Cannot fetch GPU Utilization!"
-                data = list(map(float, output.strip().split(b'\n')))
-                stats += data
-                cnt += 1
+            with NVMLContext() as ctx:
+                while True:
+                    time.sleep(1)
 
-                if evt.is_set():    # stop epoch
-                    if stop_evt.is_set():   # or on exit
-                        return
-                    evt.clear()
-                    rst_queue.put(stats / cnt)
-                    break
+                    data = [ctx.device(i).utilization()['gpu'] for i in self._devices]
+                    data = list(map(float, data))
+                    stats += data
+                    cnt += 1
+
+                    if evt.is_set():    # stop epoch
+                        if stop_evt.is_set():   # or on exit
+                            return
+                        evt.clear()
+                        # Ignore the last datapoint. Usually is zero, makes us underestimate the util.
+                        stats -= data
+                        cnt -= 1
+                        rst_queue.put(stats / cnt)
+                        break
 
 
 # Can add more features from tfprof
@@ -108,7 +116,7 @@ class GPUUtilizationTracker(Callback):
 class GraphProfiler(Callback):
     """
     Enable profiling by installing session hooks,
-    and write metadata or tracing files to ``logger.get_logger_dir()``.
+    and write tracing files / events / metadata to ``logger.get_logger_dir()``.
 
     The tracing files can be loaded from ``chrome://tracing``.
     The metadata files can be processed by
@@ -116,9 +124,16 @@ class GraphProfiler(Callback):
     <https://github.com/tensorflow/tensorflow/blob/master/tensorflow/core/profiler/README.md>`_.
     The event is viewable from tensorboard.
 
-    Note that the profiling is enabled for every step.
-    You probably want to schedule it less frequently by
-    :class:`PeriodicRunHooks`.
+    Tips:
+
+    Note that the profiling is by default enabled for every step and is expensive.
+    You probably want to schedule it less frequently, e.g.:
+
+    .. code-block:: none
+
+        EnableCallbackIf(
+            GraphProfiler(dump_tracing=True, dump_event=True),
+            lambda self: self.trainer.global_step > 20 and self.trainer.global_step < 30)
     """
     def __init__(self, dump_metadata=False, dump_tracing=True, dump_event=False):
         """
@@ -132,7 +147,7 @@ class GraphProfiler(Callback):
         self._dump_meta = bool(dump_metadata)
         self._dump_tracing = bool(dump_tracing)
         self._dump_event = bool(dump_event)
-        assert os.path.isdir(self._dir)
+        assert os.path.isdir(self._dir), self._dir
 
     def _before_run(self, _):
         opt = tf.RunOptions()
@@ -171,15 +186,21 @@ class GraphProfiler(Callback):
 
 class PeakMemoryTracker(Callback):
     """
-    Track peak memory in each session run, by
-    :mod:`tf.contrib.memory_stats`.
-    It can only be used for GPUs.
+    Track peak memory used on each GPU device every epoch, by :mod:`tf.contrib.memory_stats`.
+    The peak memory comes from the `MaxBytesInUse` op, which might span
+    multiple session.run.
+    See https://github.com/tensorflow/tensorflow/pull/13107.
     """
-    def __init__(self, devices=['/gpu:0']):
+
+    _chief_only = False
+
+    def __init__(self, devices=[0]):
         """
         Args:
-            devices([str]): list of devices to track memory on.
+            devices([int] or [str]): list of GPU devices to track memory on.
         """
+        assert isinstance(devices, (list, tuple)), devices
+        devices = ['/gpu:{}'.format(x) if isinstance(x, int) else x for x in devices]
         self._devices = devices
 
     def _setup_graph(self):
@@ -191,9 +212,12 @@ class PeakMemoryTracker(Callback):
         self._fetches = tf.train.SessionRunArgs(fetches=ops)
 
     def _before_run(self, _):
-        return self._fetches
+        if self.local_step == self.trainer.steps_per_epoch - 1:
+            return self._fetches
+        return None
 
     def _after_run(self, _, rv):
         results = rv.results
-        for mem, dev in zip(results, self._devices):
-            self.trainer.monitors.put_scalar('PeakMemory(MB)' + dev, mem / 1e6)
+        if results is not None:
+            for mem, dev in zip(results, self._devices):
+                self.trainer.monitors.put_scalar('PeakMemory(MB)' + dev, mem / 1e6)

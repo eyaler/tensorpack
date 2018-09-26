@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # File: develop.py
 # Author: tensorpack contributors
@@ -12,8 +11,11 @@ import functools
 from datetime import datetime
 import importlib
 import types
+import six
 
 from . import logger
+
+__all__ = []
 
 
 def create_dummy_class(klass, dependency):
@@ -27,9 +29,18 @@ def create_dummy_class(klass, dependency):
     Returns:
         class: a class object
     """
+
+    class _DummyMetaClass(type):
+        # throw error on class attribute access
+        def __getattr__(_, __):
+            raise ImportError("Cannot import '{}', therefore '{}' is not available".format(dependency, klass))
+
+    @six.add_metaclass(_DummyMetaClass)
     class _Dummy(object):
+        # throw error on constructor
         def __init__(self, *args, **kwargs):
             raise ImportError("Cannot import '{}', therefore '{}' is not available".format(dependency, klass))
+
     return _Dummy
 
 
@@ -44,7 +55,7 @@ def create_dummy_func(func, dependency):
     Returns:
         function: a function object
     """
-    if isinstance(dependency, (list, str)):
+    if isinstance(dependency, (list, tuple)):
         dependency = ','.join(dependency)
 
     def _dummy(*args, **kwargs):
@@ -58,7 +69,7 @@ def building_rtfd():
         bool: if tensorpack is being imported to generate docs now.
     """
     return os.environ.get('READTHEDOCS') == 'True' \
-        or os.environ.get('TENSORPACK_DOC_BUILDING')
+        or os.environ.get('DOC_BUILDING')
 
 
 def log_deprecated(name="", text="", eos=""):
@@ -120,6 +131,11 @@ def deprecated(text="", eos=""):
             return func(*args, **kwargs)
         return new_func
     return deprecated_inner
+
+
+def HIDE_DOC(func):
+    func.__HIDE_SPHINX_DOC__ = True
+    return func
 
 
 # Copied from https://github.com/tensorflow/tensorflow/blob/master/tensorflow/python/util/lazy_loader.py

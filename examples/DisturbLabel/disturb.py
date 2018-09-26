@@ -1,7 +1,6 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # File: disturb.py
-# Author: Yuxin Wu <ppwwyyxxc@gmail.com>
+# Author: Yuxin Wu
 
 from tensorpack.dataflow import ProxyDataFlow, RNGDataFlow
 
@@ -12,10 +11,11 @@ class DisturbLabel(ProxyDataFlow, RNGDataFlow):
         self.prob = prob
 
     def reset_state(self):
-        super(DisturbLabel, self).reset_state()
+        RNGDataFlow.reset_state(self)
+        ProxyDataFlow.reset_state(self)
 
-    def get_data(self):
-        for dp in self.ds.get_data():
+    def __iter__(self):
+        for dp in self.ds:
             img, l = dp
             if self.rng.rand() < self.prob:
                 l = self.rng.choice(10)

@@ -1,10 +1,9 @@
 # Efficient DataFlow
 
-This tutorial gives an overview of how to build an efficient DataFlow, using ImageNet
-dataset as an example.
+This tutorial gives an overview of how to build an efficient DataFlow, using ImageNet dataset as an example.
 Our goal in the end is to have
 a __Python generator__ which yields preprocessed ImageNet images and labels as fast as possible.
-Since it is simply a generator interface, you can use the DataFlow in other Python-based frameworks (e.g. Keras)
+Since it is simply a generator interface, you can use the DataFlow in any Python-based frameworks (e.g. PyTorch, Keras)
 or your own code as well.
 
 **What we are going to do**: We'll use ILSVRC12 dataset, which contains 1.28 million images.
@@ -13,10 +12,10 @@ The average resolution is about 400x350 <sup>[[1]]</sup>.
 Following the [ResNet example](../examples/ResNet), we need images in their original resolution,
 so we will read the original dataset (instead of a down-sampled version), and
 then apply complicated preprocessing to it.
-We will need to reach a speed of, roughly **1k ~ 2k images per second**, to keep GPUs busy.
+We aim to reach a speed of, roughly **1k~3k images per second**, to keep GPUs busy.
 
 Some things to know before reading:
-1. For smaller datasets (e.g. several GBs of images with lightweight preprocessing), a simple reader plus some prefetch should usually work well enough.
+1. For smaller datasets (e.g. several GBs of images with lightweight preprocessing), a simple reader plus some multiprocess prefetch should usually work well enough.
 	 Therefore you don't have to understand this tutorial in depth unless you really find your data being the bottleneck.
 	 This tutorial could be a bit complicated for people new to system architectures, but you do need these to be able to run fast enough on ImageNet-scale dataset.
 2. Having a fast Python generator **alone** may or may not improve your overall training speed.
@@ -30,6 +29,9 @@ Some things to know before reading:
 4. The actual performance would depend on not only the disk, but also memory (for caching) and CPU (for data processing).
 	 You may need to tune the parameters (#processes, #threads, size of buffer, etc.)
 	 or change the pipeline for new tasks and new machines to achieve the best performance.
+
+The benchmark code for this tutorial can be found in [tensorpack/benchmarks](https://github.com/tensorpack/benchmarks/tree/master/ImageNet),
+including comparison with a similar (but simpler) pipeline built with `tf.data`.
 
 ## Random Read
 
@@ -66,7 +68,7 @@ We will now add the cheapest pre-processing now to get an ndarray in the end ins
 		ds = AugmentImageComponent(ds, [imgaug.Resize(224)])
 		ds = BatchData(ds, 256)
 ```
-You'll start to observe slow down after adding more pre-processing (such as those in the [ResNet example](../examples/ResNet/imagenet_utils.py)).
+You'll start to observe slow down after adding more pre-processing (such as those in the [ResNet example](../examples/ImageNetModels/imagenet_utils.py)).
 Now it's time to add threads or processes:
 ```eval_rst
 .. code-block:: python
@@ -127,7 +129,7 @@ If you identify this as a bottleneck, you can also use:
 Let's summarize what the above dataflow does:
 1. One thread iterates over a shuffled list of (filename, label) pairs, and put them into a queue of size 1000.
 2. 25 worker threads take pairs and make them into (preprocessed image, label) pairs.
-3. Both 1 and 2 happen in one separate process, and the results are sent back to main process through ZeroMQ.
+3. Both 1 and 2 happen together in a separate process, and the results are sent back to main process through ZeroMQ.
 4. Main process makes batches, and other tensorpack modules will then take care of how they should go into the graph.
 
 Note that in an actual training setup, I used the above multiprocess version for training set since
@@ -140,16 +142,16 @@ We can also dump the dataset into one single LMDB file and read it sequentially.
 
 ```python
 from tensorpack.dataflow import *
-class BinaryILSVRC12(dataset.ILSVRCFiles):
-    def get_data(self):
-        for fname, label in super(BinaryILSVRC12, self).get_data():
+class BinaryILSVRC12(dataset.ILSVRC12Files):
+    def __iter__(self):
+        for fname, label in super(BinaryILSVRC12, self).__iter__():
             with open(fname, 'rb') as f:
                 jpeg = f.read()
             jpeg = np.asarray(bytearray(jpeg), dtype='uint8')
             yield [jpeg, label]
-ds0 = BinaryILSVRC12()
+ds0 = BinaryILSVRC12('/path/to/ILSVRC/', 'train')
 ds1 = PrefetchDataZMQ(ds0, nr_proc=1)
-dftools.dump_dataflow_to_lmdb(ds1, '/path/to/ILSVRC-train.lmdb')
+LMDBSerializer.save(ds1, '/path/to/ILSVRC-train.lmdb')
 ```
 The above script builds a DataFlow which produces jpeg-encoded ImageNet data.
 We store the jpeg string as a numpy array because the function `cv2.imdecode` later expect this format.
@@ -158,9 +160,9 @@ from several forks of `ds0`, then neither the content nor the order of `ds1` wil
 See [documentation](../modules/dataflow.html#tensorpack.dataflow.PrefetchDataZMQ)
 about caveats of `PrefetchDataZMQ`.
 
-It will generate a database file of 140G. We build a DataFlow to read this LMDB file sequentially:
+It will generate a database file of 140G. We load the DataFlow back by reading this LMDB file sequentially:
 ```
-ds = LMDBData('/path/to/ILSVRC-train.lmdb', shuffle=False)
+ds = LMDBSerializer.load('/path/to/ILSVRC-train.lmdb', shuffle=False)
 ds = BatchData(ds, 256, use_list=True)
 TestDataSpeed(ds).start()
 ```
@@ -173,7 +175,7 @@ As a reference, on Samsung SSD 850, the uncached speed is about 16it/s.
 .. code-block:: python
 	  :emphasize-lines: 2
 
-	  ds = LMDBData('/path/to/ILSVRC-train.lmdb', shuffle=False)
+	  ds = LMDBSerializer.load('/path/to/ILSVRC-train.lmdb', shuffle=False)
 	  ds = LocallyShuffleData(ds, 50000)
 	  ds = BatchData(ds, 256, use_list=True)
 ```
@@ -187,16 +189,15 @@ Then we add necessary transformations:
 .. code-block:: python
     :emphasize-lines: 3-5
 
-    ds = LMDBData(db, shuffle=False)
+    ds = LMDBSerializer.load(db, shuffle=False)
     ds = LocallyShuffleData(ds, 50000)
-    ds = LMDBDataPoint(ds)
     ds = MapDataComponent(ds, lambda x: cv2.imdecode(x, cv2.IMREAD_COLOR), 0)
     ds = AugmentImageComponent(ds, lots_of_augmentors)
     ds = BatchData(ds, 256)
 ```
 
-1. `LMDBDataPoint` deserialize the datapoints (from raw bytes to [jpeg_string, label] -- what we dumped in `RawILSVRC12`)
-2. Use OpenCV to decode the first component into ndarray
+1. First we deserialize the datapoints (from raw bytes to [jpeg bytes, label] -- what we dumped in `RawILSVRC12`)
+2. Use OpenCV to decode the first component (jpeg bytes) into ndarray
 3. Apply augmentations to the ndarray
 
 Both imdecode and the augmentors can be quite slow. We can parallelize them like this:
@@ -204,10 +205,9 @@ Both imdecode and the augmentors can be quite slow. We can parallelize them like
 .. code-block:: python
     :emphasize-lines: 3,7
 
-    ds = LMDBData(db, shuffle=False)
+    ds = LMDBSerializer.load(db, shuffle=False)
     ds = LocallyShuffleData(ds, 50000)
     ds = PrefetchData(ds, 5000, 1)
-    ds = LMDBDataPoint(ds)
     ds = MapDataComponent(ds, lambda x: cv2.imdecode(x, cv2.IMREAD_COLOR), 0)
     ds = AugmentImageComponent(ds, lots_of_augmentors)
     ds = PrefetchDataZMQ(ds, 25)
@@ -229,9 +229,10 @@ Let me summarize what this DataFlow does:
 	 send them through ZMQ IPC pipe.
 3. The main process takes data from the pipe, makes batches.
 
-The two DataFlow mentioned in this tutorial (both random read and sequential read) can run at a speed of 1k ~ 2k images per second if you have good CPUs, RAM, disks.
+The two DataFlow mentioned in this tutorial (both random read and sequential read) can run at a speed of 1k ~ 2.5k images per second if you have good CPUs, RAM, disks.
+With fewer augmentations, it can reach 5k images/s.
 As a reference, tensorpack can train ResNet-18 at 1.2k images/s on 4 old TitanX.
-A DGX-1 (8 P100) can train ResNet-50 at 1.7k images/s according to the [official benchmark](https://www.tensorflow.org/performance/benchmarks).
+8 P100s can train ResNet-50 at 1.7k images/s according to the [official benchmark](https://www.tensorflow.org/performance/benchmarks).
 So DataFlow will not be a serious bottleneck if configured properly.
 
 ## Distributed DataFlow
@@ -251,11 +252,11 @@ send_dataflow_zmq(df, 'tcp://1.2.3.4:8877')
 ```python
 # Training Machine, process 1-10:
 df = MyLargeData()
-send_dataflow_zmq(df, 'ipc:///tmp/ipc-socket')
+send_dataflow_zmq(df, 'ipc://@my-socket')
 ```
 ```python
 # Training Machine, training process
-df = RemoteDataZMQ('ipc:///tmp/ipc-socket', 'tcp://0.0.0.0:8877')
+df = RemoteDataZMQ('ipc://@my-socket', 'tcp://0.0.0.0:8877')
 TestDataSpeed(df).start()
 ```
 

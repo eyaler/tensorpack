@@ -1,7 +1,6 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # File: paste.py
-# Author: Yuxin Wu <ppwwyyxxc@gmail.com>
+
 
 from .base import ImageAugmentor
 
@@ -85,7 +84,7 @@ class CenterPaste(ImageAugmentor):
 
 class RandomPaste(CenterPaste):
     """
-    Randomly paste the image onto a background convas.
+    Randomly paste the image onto a background canvas.
     """
 
     def _get_augment_params(self, img):

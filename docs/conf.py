@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-#
+# flake8: noqa
 # tensorpack documentation build configuration file, created by
 # sphinx-quickstart on Sun Mar 27 01:41:24 2016.
 #
@@ -20,17 +20,18 @@ import inspect
 # add these directories to sys.path here. If the directory is relative to the
 # documentation root, use os.path.abspath to make it absolute, like shown here.
 sys.path.insert(0, os.path.abspath('../'))
-os.environ['TENSORPACK_DOC_BUILDING'] = '1'
+os.environ['DOC_BUILDING'] = '1'
 ON_RTD = (os.environ.get('READTHEDOCS') == 'True')
 
 
-MOCK_MODULES = ['scipy', 'tabulate',
-                'sklearn.datasets', 'sklearn',
-                'scipy.misc', 'h5py', 'nltk',
-                'cv2', 'scipy.io', 'dill', 'zmq', 'subprocess32', 'lmdb',
-                'tornado.concurrent', 'tornado',
-                'msgpack', 'msgpack_numpy',
-                'gym', 'functools32']
+MOCK_MODULES = ['tabulate', 'h5py',
+                'cv2', 'zmq', 'lmdb',
+                'sklearn', 'sklearn.datasets',
+                'scipy', 'scipy.misc', 'scipy.io',
+                'tornado', 'tornado.concurrent',
+                'horovod', 'horovod.tensorflow',
+                'pyarrow',
+                'subprocess32', 'functools32']
 for mod_name in MOCK_MODULES:
     sys.modules[mod_name] = mock.Mock(name=mod_name)
 sys.modules['cv2'].__version__ = '3.2.1'    # fake version
@@ -68,7 +69,7 @@ if ON_RTD:
 else:
     # skip this when building locally
     intersphinx_timeout = 0.1
-intersphinx_mapping = {'python': ('https://docs.python.org/3.4', None)}
+intersphinx_mapping = {'python': ('https://docs.python.org/3.6', None)}
 # -------------------------
 
 # Add any paths that contain templates here, relative to this directory.
@@ -91,8 +92,8 @@ master_doc = 'index'
 
 # General information about the project.
 project = u'tensorpack'
-copyright = u'2015 - 2017, Yuxin Wu'
-author = u'Yuxin Wu'
+copyright = u'2015 - 2018, Yuxin Wu, et al.'
+author = u'Yuxin Wu, et al.'
 
 # The version info for the project you're documenting, acts as replacement for
 # |version| and |release|, also used in various other places throughout the
@@ -177,7 +178,7 @@ html_theme_options = {}
 # The name of an image file (relative to this directory) to use as a favicon of
 # the docs.  This file should be a Windows icon file (.ico) being 16x16 or 32x32
 # pixels large.
-#html_favicon = None
+html_favicon = '_static/favicon.ico'
 
 # Add any paths that contain custom static files (such as style sheets) here,
 # relative to this directory. They are copied after the builtin static files,
@@ -352,26 +353,53 @@ def process_signature(app, what, name, obj, options, signature,
     # signature: arg list
     return signature, return_annotation
 
-def autodoc_skip_member(app, what, name, obj, skip, options):
-    if name in [
-        'MultiGPUTrainerBase',
-        'FeedfreeInferenceRunner',
-        'replace_get_variable',
-        'remap_get_variable',
-        'freeze_get_variable',
-        'predictor_factory',
-        'get_predictors',
-        'RandomCropAroundBox',
-        'GaussianDeform',
-        'dump_chkpt_vars',
-        'VisualQA',
-        'DumpTensor',
-        'StagingInputWrapper',
-        'StepTensorPrinter',
 
-        'guided_relu', 'saliency_map', 'get_scalar_var',
-        'prediction_incorrect', 'huber_loss',
-        ]:
+_DEPRECATED_NAMES = set([
+    # deprecated stuff:
+    'TryResumeTraining',
+    'QueueInputTrainer',
+    'SimplePredictBuilder',
+    'LMDBDataPoint',
+    'TFRecordData',
+    'dump_dataflow_to_lmdb',
+    'dump_dataflow_to_tfrecord',
+    'pyplot2img',
+    'IntBox', 'FloatBox',
+
+    # renamed stuff:
+    'DumpTensor',
+    'DumpParamAsImage',
+    'StagingInputWrapper',
+    'PeriodicRunHooks',
+    'get_nr_gpu',
+
+    # deprecated or renamed symbolic code
+    'ImageSample',
+    'BilinearUpSample'
+    'Deconv2D',
+    'get_scalar_var', 'psnr',
+    'prediction_incorrect', 'huber_loss',
+
+    # internal only
+    'SessionUpdate',
+    'apply_default_prefetch',
+    'average_grads',
+    'aggregate_grads',
+    'allreduce_grads',
+    'PrefetchOnGPUs',
+])
+
+def autodoc_skip_member(app, what, name, obj, skip, options):
+    # we hide something deliberately
+    if getattr(obj, '__HIDE_SPHINX_DOC__', False):
+        return True
+    if name == '__init__':
+        if obj.__doc__ and skip:
+            # include_init_with_doc doesn't work well for decorated init
+            # https://github.com/sphinx-doc/sphinx/issues/4258
+            return False
+    # Hide some names that are deprecated or not intended to be used
+    if name in _DEPRECATED_NAMES:
         return True
     if name in ['get_data', 'size', 'reset_state']:
         # skip these methods with empty docstring
@@ -385,10 +413,10 @@ def autodoc_skip_member(app, what, name, obj, skip, options):
 
 def url_resolver(url):
     if '.html' not in url:
-        return "https://github.com/ppwwyyxx/tensorpack/blob/master/" + url
+        return "https://github.com/tensorpack/tensorpack/blob/master/" + url
     else:
         if ON_RTD:
-            return "http://tensorpack.readthedocs.io/en/latest/" + url
+            return "http://tensorpack.readthedocs.io/" + url
         else:
             return '/' + url
 

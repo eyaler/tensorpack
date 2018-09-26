@@ -1,19 +1,15 @@
 #!/usr/bin/env python
-# -*- coding: UTF-8 -*-
+# -*- coding: utf-8 -*-
 # File: svhn-digit-dorefa.py
-# Author: Yuxin Wu <ppwwyyxxc@gmail.com>
+# Author: Yuxin Wu
 
 import argparse
-import numpy as np
-import os
+import tensorflow as tf
 
-os.environ['TENSORPACK_TRAIN_API'] = 'v2'   # will become default soon
 from tensorpack import *
-from tensorpack.tfutils.symbolic_functions import *
-from tensorpack.tfutils.summary import *
+from tensorpack.tfutils.summary import add_moving_summary, add_param_summary
 from tensorpack.dataflow import dataset
 from tensorpack.tfutils.varreplace import remap_variables
-import tensorflow as tf
 
 from dorefa import get_dorefa
 
@@ -23,7 +19,7 @@ DoReFa-Net: Training Low Bitwidth Convolutional Neural Networks with Low Bitwidt
 http://arxiv.org/abs/1606.06160
 
 The original experiements are performed on a proprietary framework.
-This is our attempt to reproduce it on tensorpack/tensorflow.
+This is our attempt to reproduce it on tensorpack.
 
 Accuracy:
     With (W,A,G)=(1,1,4), can reach 3.1~3.2% error after 150 epochs.
@@ -46,17 +42,14 @@ BITG = 4
 
 
 class Model(ModelDesc):
-    def _get_inputs(self):
-        return [InputDesc(tf.float32, [None, 40, 40, 3], 'input'),
-                InputDesc(tf.int32, [None], 'label')]
+    def inputs(self):
+        return [tf.placeholder(tf.float32, [None, 40, 40, 3], 'input'),
+                tf.placeholder(tf.int32, [None], 'label')]
 
-    def _build_graph(self, inputs):
-        image, label = inputs
+    def build_graph(self, image, label):
         is_training = get_current_tower_context().is_training
 
         fw, fa, fg = get_dorefa(BITW, BITA, BITG)
-
-        old_get_variable = tf.get_variable
 
         # monkey-patch tf.get_variable to apply fw
         def binarize_weight(v):
@@ -77,8 +70,8 @@ class Model(ModelDesc):
         image = image / 256.0
 
         with remap_variables(binarize_weight), \
-                argscope(BatchNorm, decay=0.9, epsilon=1e-4), \
-                argscope(Conv2D, use_bias=False, nl=tf.identity):
+                argscope(BatchNorm, momentum=0.9, epsilon=1e-4), \
+                argscope(Conv2D, use_bias=False):
             logits = (LinearWrap(image)
                       .Conv2D('conv0', 48, 5, padding='VALID', use_bias=True)
                       .MaxPooling('pool0', 2, padding='SAME')
@@ -111,11 +104,11 @@ class Model(ModelDesc):
                       .Conv2D('conv6', 512, 5, padding='VALID')
                       .apply(fg).BatchNorm('bn6')
                       .apply(cabs)
-                      .FullyConnected('fc1', 10, nl=tf.identity)())
-        prob = tf.nn.softmax(logits, name='output')
+                      .FullyConnected('fc1', 10)())
+        tf.nn.softmax(logits, name='output')
 
         # compute the number of failed samples
-        wrong = prediction_incorrect(logits, label)
+        wrong = tf.cast(tf.logical_not(tf.nn.in_top_k(logits, label, 1)), tf.float32, name='wrong_tensor')
         # monitor training error
         add_moving_summary(tf.reduce_mean(wrong, name='train_error'))
 
@@ -125,10 +118,11 @@ class Model(ModelDesc):
         wd_cost = regularize_cost('fc.*/W', l2_regularizer(1e-7))
 
         add_param_summary(('.*/W', ['histogram', 'rms']))
-        self.cost = tf.add_n([cost, wd_cost], name='cost')
-        add_moving_summary(cost, wd_cost, self.cost)
+        total_cost = tf.add_n([cost, wd_cost], name='cost')
+        add_moving_summary(cost, wd_cost, total_cost)
+        return total_cost
 
-    def _get_optimizer(self):
+    def optimizer(self):
         lr = tf.train.exponential_decay(
             learning_rate=1e-3,
             global_step=get_global_step_var(),
@@ -168,7 +162,7 @@ def get_config():
         callbacks=[
             ModelSaver(),
             InferenceRunner(data_test,
-                            [ScalarStats('cost'), ClassificationError()])
+                            [ScalarStats('cost'), ClassificationError('wrong_tensor')])
         ],
         model=Model(),
         max_epoch=200,

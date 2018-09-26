@@ -1,10 +1,10 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # File: sesscreate.py
-# Author: Yuxin Wu <ppwwyyxxc@gmail.com>
+
 
 import tensorflow as tf
 from .common import get_default_sess_config
+from ..utils import logger
 
 __all__ = ['NewSessionCreator', 'ReuseSessionCreator', 'SessionCreatorAdapter']
 
@@ -33,6 +33,9 @@ class NewSessionCreator(tf.train.ChiefSessionCreator):
             config = get_default_sess_config()
         else:
             self.user_provided_config = True
+            logger.warn(
+                "User-provided custom session config may not work due to TF \
+bugs. See https://github.com/tensorpack/tensorpack/issues/497 for workarounds.")
 
         self.config = config
         super(NewSessionCreator, self).__init__(master=target, config=config)

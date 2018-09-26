@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # File: argtools.py
 
@@ -17,7 +16,7 @@ __all__ = ['map_arg', 'memoized', 'graph_memoized', 'shape2d', 'shape4d',
 
 def map_arg(**maps):
     """
-    Apply a mapping on certains argument before calling the original function.
+    Apply a mapping on certain argument before calling the original function.
 
     Args:
         maps (dict): {argument_name: map_func}
@@ -111,7 +110,18 @@ def shape2d(a):
     raise RuntimeError("Illegal shape: {}".format(a))
 
 
-def shape4d(a, data_format='NHWC'):
+def get_data_format(data_format, tfmode=True):
+    if tfmode:
+        dic = {'NCHW': 'channels_first', 'NHWC': 'channels_last'}
+    else:
+        dic = {'channels_first': 'NCHW', 'channels_last': 'NHWC'}
+    ret = dic.get(data_format, data_format)
+    if ret not in dic.values():
+        raise ValueError("Unknown data_format: {}".format(data_format))
+    return ret
+
+
+def shape4d(a, data_format='channels_last'):
     """
     Ensuer a 4D shape, to use with 4D symbolic functions.
 
@@ -123,14 +133,14 @@ def shape4d(a, data_format='NHWC'):
             or ``[1, 1, a, a]`` depending on data_format.
     """
     s2d = shape2d(a)
-    if data_format == 'NHWC':
+    if get_data_format(data_format) == 'channels_last':
         return [1] + s2d + [1]
     else:
         return [1, 1] + s2d
 
 
 @memoized
-def log_once(message, func):
+def log_once(message, func='info'):
     """
     Log certain message only once. Call this function more than one times with
     the same message will result in no-op.
@@ -147,19 +157,25 @@ _FUNC_CALLED = set()
 
 def call_only_once(func):
     """
-    Decorate a method of a class, so that this method can only
+    Decorate a method or property of a class, so that this method can only
     be called once for every instance.
     Calling it more than once will result in exception.
     """
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         self = args[0]
-        assert hasattr(self, func.__name__), "call_only_once can only be used on method!"
+        # cannot use hasattr here, because hasattr tries to getattr, which
+        # fails if func is a property
+        assert func.__name__ in dir(self), "call_only_once can only be used on method or property!"
 
+        cls = type(self)
+        # cannot use ismethod(), because decorated method becomes a function
+        is_method = inspect.isfunction(getattr(cls, func.__name__))
         key = (self, func)
         assert key not in _FUNC_CALLED, \
-            "Method {}.{} can only be called once per object!".format(
-                type(self).__name__, func.__name__)
+            "{} {}.{} can only be called once per object!".format(
+                'Method' if is_method else 'Property',
+                cls.__name__, func.__name__)
         _FUNC_CALLED.add(key)
 
         return func(*args, **kwargs)
@@ -169,9 +185,21 @@ def call_only_once(func):
 
 if __name__ == '__main__':
     class A():
+        def __init__(self):
+            self._p = 0
+
         @call_only_once
         def f(self, x):
             print(x)
+
+        @property
+        def p(self):
+            return self._p
+
+        @p.setter
+        @call_only_once
+        def p(self, val):
+            self._p = val
 
     a = A()
     a.f(1)
@@ -179,3 +207,10 @@ if __name__ == '__main__':
     b = A()
     b.f(2)
     b.f(1)
+
+    print(b.p)
+    print(b.p)
+    b.p = 2
+    print(b.p)
+    b.p = 3
+    print(b.p)

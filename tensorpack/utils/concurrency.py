@@ -1,9 +1,10 @@
-# -*- coding: UTF-8 -*-
+# -*- coding: utf-8 -*-
 # File: concurrency.py
-# Author: Yuxin Wu <ppwwyyxx@gmail.com>
-# Credit belongs to Xinyu Zhou
+
+# Some code taken from zxytim
 
 import threading
+import platform
 import multiprocessing
 import atexit
 import bisect
@@ -14,6 +15,7 @@ import six
 from six.moves import queue
 
 from . import logger
+from .argtools import log_once
 
 if six.PY2:
     import subprocess32 as subprocess
@@ -124,10 +126,10 @@ class ShareSessionThread(threading.Thread):
     def default_sess(self):
         if self._sess:
             with self._sess.as_default():
-                yield
+                yield self._sess
         else:
             logger.warn("ShareSessionThread {} wasn't under a default session!".format(self.name))
-            yield
+            yield None
 
     def start(self):
         import tensorflow as tf
@@ -169,6 +171,27 @@ def ensure_proc_terminate(proc):
 
     assert isinstance(proc, multiprocessing.Process)
     atexit.register(stop_proc_by_weak_ref, weakref.ref(proc))
+
+
+def enable_death_signal(_warn=True):
+    """
+    Set the "death signal" of the current process, so that
+    the current process will be cleaned with guarantee
+    in case the parent dies accidentally.
+    """
+    if platform.system() != 'Linux':
+        return
+    try:
+        import prctl    # pip install python-prctl
+    except ImportError:
+        if _warn:
+            log_once('Install python-prctl so that processes can be cleaned with guarantee.', 'warn')
+        return
+    else:
+        assert hasattr(prctl, 'set_pdeathsig'), \
+            "prctl.set_pdeathsig does not exist! Note that you need to install 'python-prctl' instead of 'prctl'."
+        # is SIGHUP a good choice?
+        prctl.set_pdeathsig(signal.SIGHUP)
 
 
 def is_main_thread():
@@ -229,15 +252,15 @@ def subproc_call(cmd, timeout=None):
             shell=True, timeout=timeout)
         return output, 0
     except subprocess.TimeoutExpired as e:
-        logger.warn("Command timeout!")
+        logger.warn("Command '{}' timeout!".format(cmd))
         logger.warn(e.output.decode('utf-8'))
         return e.output, -1
     except subprocess.CalledProcessError as e:
-        logger.warn("Command failed: {}".format(e.returncode))
+        logger.warn("Command '{}' failed, return code={}".format(cmd, e.returncode))
         logger.warn(e.output.decode('utf-8'))
         return e.output, e.returncode
     except Exception:
-        logger.warn("Command failed to run: {}".format(cmd))
+        logger.warn("Command '{}' failed to run.".format(cmd))
         return "", -2
 
 

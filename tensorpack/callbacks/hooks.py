@@ -1,13 +1,11 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # File: hooks.py
-# Author: Yuxin Wu <ppwwyyxxc@gmail.com>
+
 
 """ Compatible layers between tf.train.SessionRunHook and Callback"""
 
 import tensorflow as tf
 from .base import Callback
-
 
 __all__ = ['CallbackToHook', 'HookToCallback']
 
@@ -17,6 +15,7 @@ class CallbackToHook(tf.train.SessionRunHook):
         before_run/after_run callbacks.
         You shouldn't need to use this.
     """
+
     def __init__(self, cb):
         self._cb = cb
 
@@ -30,8 +29,11 @@ class CallbackToHook(tf.train.SessionRunHook):
 class HookToCallback(Callback):
     """
     Make a ``tf.train.SessionRunHook`` into a callback.
-    Note that the `coord` argument in `after_create_session` will be None.
+    Note that when `SessionRunHook.after_create_session` is called, the `coord` argument will be None.
     """
+
+    _chief_only = False
+
     def __init__(self, hook):
         """
         Args:

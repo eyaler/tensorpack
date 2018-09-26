@@ -3,7 +3,6 @@
 
 import cv2
 import sys
-import os
 
 from contextlib import contextmanager
 import numpy as np
@@ -39,18 +38,32 @@ def guided_relu():
         yield
 
 
-class Model(tp.ModelDesc):
-    def _get_inputs(self):
-        return [tp.InputDesc(tf.float32, (IMAGE_SIZE, IMAGE_SIZE, 3), 'image')]
+def saliency_map(output, input, name="saliency_map"):
+    """
+    Produce a saliency map as described in the paper:
+    `Deep Inside Convolutional Networks: Visualising Image Classification Models and Saliency Maps
+    <https://arxiv.org/abs/1312.6034>`_.
+    The saliency map is the gradient of the max element in output w.r.t input.
 
-    def _build_graph(self, inputs):
-        orig_image = inputs[0]
+    Returns:
+        tf.Tensor: the saliency map. Has the same shape as input.
+    """
+    max_outp = tf.reduce_max(output, 1)
+    saliency_op = tf.gradients(max_outp, input)[:][0]
+    return tf.identity(saliency_op, name=name)
+
+
+class Model(tp.ModelDescBase):
+    def inputs(self):
+        return [tf.placeholder(tf.float32, (IMAGE_SIZE, IMAGE_SIZE, 3), 'image')]
+
+    def build_graph(self, orig_image):
         mean = tf.get_variable('resnet_v1_50/mean_rgb', shape=[3])
         with guided_relu():
             with slim.arg_scope(resnet_v1.resnet_arg_scope(is_training=False)):
                 image = tf.expand_dims(orig_image - mean, 0)
                 logits, _ = resnet_v1.resnet_v1_50(image, 1000)
-            tp.symbolic_functions.saliency_map(logits, orig_image, name="saliency")
+            saliency_map(logits, orig_image, name="saliency")
 
 
 def run(model_path, image_path):

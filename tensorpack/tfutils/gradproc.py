@@ -1,7 +1,6 @@
-#!/usr/bin/env python
-# -*- coding: UTF-8 -*-
+# -*- coding: utf-8 -*-
 # File: gradproc.py
-# Author: Yuxin Wu <ppwwyyxx@gmail.com>
+
 
 import tensorflow as tf
 from abc import ABCMeta, abstractmethod
@@ -19,7 +18,10 @@ __all__ = ['GradientProcessor',
 
 @six.add_metaclass(ABCMeta)
 class GradientProcessor(object):
-    """ Base class for all gradient processors.
+    """
+    Base class for all gradient processors.
+    Gradient processors can be applied to optimizers by
+    :func:`optimizer.apply_grad_processors`.
 
     Subclass should override the ``_process()`` method.
     """
@@ -72,7 +74,7 @@ class FilterNoneGrad(GradientProcessor):
                 g.append((grad, var))
         if self._verbose and len(to_print):
             message = ', '.join(to_print)
-            logger.warn("No gradient w.r.t these trainable variables: {}".format(message))
+            logger.warn("No gradient w.r.t {} trainable variables: {}".format(len(to_print), message))
         return g
 
 
@@ -102,13 +104,17 @@ class MapGradient(GradientProcessor):
     """
     Apply a function on all gradient if the name matches regex.
     Keep the other gradients unchanged.
+
+    It can be used for gradient clipping, etc.
     """
 
     def __init__(self, func, regex='.*'):
         """
         Args:
-            func: takes a grad or (grad, var) pair and returns a grad. If return None, the
-                gradient is discarded (hence no update to the variable will happen).
+            func: a user-supplied function which takes one or two arguments.
+                The argument(s) can be either a `grad` tensor, or `grad` and `var`.
+                The function should return the new gradient to be used.
+                If it return None, the gradient is discarded (hence no update to the variable will happen).
             regex (str): used to match variables. Defaults to match all variables.
         """
         args = inspect.getargspec(func).args
@@ -152,18 +158,23 @@ class SummaryGradient(MapGradient):
     # TODO this is global. not good.
     _summaried_gradient = set()
 
-    def __init__(self, regex='.*'):
+    def __init__(self, regex='.*', collections=None):
         """
         Args:
             regex(str): same as in :class:`MapGradient`.
+            collections (list[str]): list of collection names
         """
         super(SummaryGradient, self).__init__(self._mapper, regex)
+        self._coll = collections
 
     def _mapper(self, grad, var):
         name = var.op.name
+        if re.match('tower[0-9]+/', name):
+            # replicated training, var may come from different towers
+            return grad
         if name not in SummaryGradient._summaried_gradient:
             SummaryGradient._summaried_gradient.add(name)
-            tf.summary.histogram(name + '-grad', grad)
+            tf.summary.histogram(name + '-grad', grad, collections=self._coll)
             add_moving_summary(rms(grad, name=name + '/rms'))
         return grad
 
@@ -192,15 +203,14 @@ class PrintGradient(MapGradient):
 
 class CheckGradient(MapGradient):
     """
-    Check for numeric issue.
-    See :func:`tf.check_numerics` for more information.
+    Run :func:`tf.check_numerics` for each gradient.
     """
 
     def __init__(self):
         super(CheckGradient, self).__init__(self._mapper)
 
     def _mapper(self, grad, var):
-        # this is very slow.... see #3649
+        # this was very slow.... see #3649
         # op = tf.Assert(tf.reduce_all(tf.is_finite(var)), [var], summarize=100)
         grad = tf.check_numerics(grad, 'CheckGradient/' + var.op.name)
         return grad
@@ -211,26 +221,26 @@ class ScaleGradient(MapGradient):
     Scale certain gradient by a multiplier.
     """
 
-    def __init__(self, multipliers, verbose=True, log=None):
+    def __init__(self, multipliers, verbose=True):
         """
         Args:
-            multipliers (tuple or list): tuple of (regex, float), or list of tuples.
+            multipliers (tuple or list): tuple of (regex, float), or list of such tuples.
             verbose (bool): whether to print logs or not
-            log: deprecated
 
         Example:
-            Use double learning rate for all the bias (as in caffe):
+            Use double learning rate for all the bias (as in caffe), and freeze layer0:
 
             .. code-block:: python
 
-                ScaleGradient(('.*/b', 2))
+                from tensorpack.tfutils import optimizer, gradproc
+                opt = optimizer.apply_grad_processors(
+                    opt, [gradproc.ScaleGradient(
+                        [('.*/b', 2.), ('layer0/.*', 0.)]
+                    )])
         """
         if not isinstance(multipliers, list):
             multipliers = [multipliers]
         self.multipliers = multipliers
-        if log is not None:
-            logger.warn("'log' in ScaleGradient(..) is renamed to 'verbose'.")
-            verbose = log
         assert verbose in [True, False], verbose
         self._verbose = verbose
         super(ScaleGradient, self).__init__(self._mapper)
@@ -244,7 +254,7 @@ class ScaleGradient(MapGradient):
 
             if re.match(regex, varname):
                 if self._verbose:
-                    logger.info("Apply lr multiplier {} for {}".format(val, varname))
+                    logger.info("Gradient of '{}' is multipled by {}".format(varname, val))
                 if val != 0:    # skip zero to speed up
                     return grad * val
                 else:

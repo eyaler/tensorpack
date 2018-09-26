@@ -1,16 +1,10 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # File: WGAN.py
-# Author: Yuxin Wu <ppwwyyxxc@gmail.com>
+# Author: Yuxin Wu
 
-import os
-import argparse
-
-os.environ['TENSORPACK_TRAIN_API'] = 'v2'   # will become default soon
 from tensorpack import *
-from tensorpack.tfutils import optimizer
 from tensorpack.tfutils.summary import add_moving_summary
-from tensorpack.utils.globvars import globalns as G
 import tensorflow as tf
 from GAN import SeparateGANTrainer
 
@@ -20,9 +14,8 @@ See the docstring in DCGAN.py for usage.
 """
 
 # Don't want to mix two examples together, but want to reuse the code.
-# So here just import stuff from DCGAN, and change the batch size & model
+# So here just import stuff from DCGAN
 import DCGAN
-G.BATCH = 64
 
 
 class Model(DCGAN.Model):
@@ -35,12 +28,13 @@ class Model(DCGAN.Model):
         self.g_loss = tf.negative(tf.reduce_mean(vecneg), name='g_loss')
         add_moving_summary(self.d_loss, self.g_loss)
 
-    def _get_optimizer(self):
+    def optimizer(self):
         opt = tf.train.RMSPropOptimizer(1e-4)
         return opt
 
         # An alternative way to implement the clipping:
         """
+        from tensorpack.tfutils import optimizer
         def clip(v):
             n = v.op.name
             if not n.startswith('discrim/'):
@@ -68,20 +62,19 @@ class ClipCallback(Callback):
 
 
 if __name__ == '__main__':
-    args = DCGAN.get_args()
+    args = DCGAN.get_args(default_batch=64)
 
+    M = Model(shape=args.final_size, batch=args.batch, z_dim=args.z_dim)
     if args.sample:
-        DCGAN.sample(Model(), args.load)
+        DCGAN.sample(M, args.load)
     else:
-        assert args.data
         logger.auto_set_dir()
 
         # The original code uses a different schedule, but this seems to work well.
         # Train 1 D after 2 G
         SeparateGANTrainer(
-            input=QueueInput(DCGAN.get_data(args.data)),
-            model=Model(),
-            d_period=3).train_with_defaults(
+            input=QueueInput(DCGAN.get_data()),
+            model=M, d_period=3).train_with_defaults(
             callbacks=[ModelSaver(), ClipCallback()],
             steps_per_epoch=500,
             max_epoch=200,

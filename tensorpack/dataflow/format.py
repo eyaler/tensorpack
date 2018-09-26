@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # File: format.py
-# Author: Yuxin Wu <ppwwyyxxc@gmail.com>
+
 
 import numpy as np
 import six
@@ -11,8 +11,9 @@ from ..utils import logger
 from ..utils.utils import get_tqdm
 from ..utils.timer import timed_operation
 from ..utils.loadcaffe import get_caffe_pb
-from ..utils.serialize import loads
+from ..utils.compatible_serialize import loads
 from ..utils.argtools import log_once
+from ..utils.develop import log_deprecated
 from .base import RNGDataFlow, DataFlow, DataFlowReentrantGuard
 from .common import MapData
 
@@ -49,10 +50,10 @@ class HDF5Data(RNGDataFlow):
         self._size = lens[0]
         self.shuffle = shuffle
 
-    def size(self):
+    def __len__(self):
         return self._size
 
-    def get_data(self):
+    def __iter__(self):
         idxs = list(range(self._size))
         if self.shuffle:
             self.rng.shuffle(idxs)
@@ -61,7 +62,12 @@ class HDF5Data(RNGDataFlow):
 
 
 class LMDBData(RNGDataFlow):
-    """ Read a LMDB database and produce (k,v) raw string pairs.
+    """
+    Read a LMDB database and produce (k,v) raw bytes pairs.
+    The raw bytes are usually not what you're interested in.
+    You might want to use
+    :class:`LMDBDataDecoder` or apply a
+    mapper function after :class:`LMDBData`.
     """
     def __init__(self, lmdb_path, shuffle=True, keys=None):
         """
@@ -72,8 +78,8 @@ class LMDBData(RNGDataFlow):
                 It can also be a format string e.g. ``{:0>8d}`` which will be
                 formatted with the indices from 0 to *total_size - 1*.
 
-                If not provided, it will then look in the database for ``__keys__`` which
-                :func:`dump_dataflow_to_lmdb` used to store the list of keys.
+                If not given, it will then look in the database for ``__keys__`` which
+                :func:`LMDBSerializer.save` used to store the list of keys.
                 If still not found, it will iterate over the database to find
                 all the keys.
         """
@@ -126,10 +132,10 @@ class LMDBData(RNGDataFlow):
         super(LMDBData, self).reset_state()
         self._open_lmdb()
 
-    def size(self):
+    def __len__(self):
         return self._size
 
-    def get_data(self):
+    def __iter__(self):
         with self._guard:
             if not self._shuffle:
                 c = self._txn.cursor()
@@ -145,7 +151,7 @@ class LMDBData(RNGDataFlow):
 
 
 class LMDBDataDecoder(MapData):
-    """ Read a LMDB database and produce a decoded output."""
+    """ Read a LMDB database with a custom decoder and produce decoded outputs."""
     def __init__(self, lmdb_data, decoder):
         """
         Args:
@@ -159,31 +165,12 @@ class LMDBDataDecoder(MapData):
 
 
 class LMDBDataPoint(MapData):
-    """
-    Read a LMDB file and produce deserialized datapoints.
-    It only accepts the database produced by
-    :func:`tensorpack.dataflow.dftools.dump_dataflow_to_lmdb`,
-    which uses :func:`tensorpack.utils.serialize.dumps` for serialization.
-
-    Example:
-        .. code-block:: python
-
-            ds = LMDBDataPoint("/data/ImageNet.lmdb", shuffle=False)
-
-            # alternatively:
-            ds = LMDBData("/data/ImageNet.lmdb", shuffle=False)
-            ds = LocallyShuffleData(ds, 50000)
-            ds = LMDBDataPoint(ds)
-    """
-
     def __init__(self, *args, **kwargs):
-        """
-        Args:
-            args, kwargs: Same as in :class:`LMDBData`.
-        """
-
+        log_deprecated("LMDBDataPoint", "Use LMDBSerializer.load() instead!", "2019-01-31")
         if isinstance(args[0], DataFlow):
             ds = args[0]
+            assert len(args) == 1 and len(kwargs) == 0, \
+                "No more arguments are allowed if LMDBDataPoint is called with a LMDBData instance!"
         else:
             ds = LMDBData(*args, **kwargs)
 
@@ -231,7 +218,7 @@ def CaffeLMDB(lmdb_path, shuffle=True, keys=None):
 
 
 class SVMLightData(RNGDataFlow):
-    """ Read X,y from a svmlight file, and produce [X_i, y_i] pairs. """
+    """ Read X,y from an SVMlight file, and produce [X_i, y_i] pairs. """
 
     def __init__(self, filename, shuffle=True):
         """
@@ -244,11 +231,11 @@ class SVMLightData(RNGDataFlow):
         self.X = np.asarray(self.X.todense())
         self.shuffle = shuffle
 
-    def size(self):
+    def __len__(self):
         return len(self.y)
 
-    def get_data(self):
-        idxs = np.arange(self.size())
+    def __iter__(self):
+        idxs = np.arange(self.__len__())
         if self.shuffle:
             self.rng.shuffle(idxs)
         for id in idxs:
@@ -256,27 +243,17 @@ class SVMLightData(RNGDataFlow):
 
 
 class TFRecordData(DataFlow):
-    """
-    Produce datapoints from a TFRecord file, assuming each record is
-    serialized by :func:`serialize.dumps`.
-    This class works with :func:`dftools.dump_dataflow_to_tfrecord`.
-    """
     def __init__(self, path, size=None):
-        """
-        Args:
-            path (str): path to the tfrecord file
-            size (int): total number of records, because this metadata is not
-                stored in the tfrecord file.
-        """
+        log_deprecated("TFRecordData", "Use TFRecordSerializer.load instead!", "2019-01-31")
         self._path = path
         self._size = int(size)
 
-    def size(self):
+    def __len__(self):
         if self._size:
             return self._size
-        return super(TFRecordData, self).size()
+        return len(super(TFRecordData, self))
 
-    def get_data(self):
+    def __iter__(self):
         gen = tf.python_io.tf_record_iterator(self._path)
         for dp in gen:
             yield loads(dp)

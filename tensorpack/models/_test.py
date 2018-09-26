@@ -1,7 +1,6 @@
-#!/usr/bin/env python
-# -*- coding: UTF-8 -*-
+# -*- coding: utf-8 -*-
 # File: _test.py
-# Author: Yuxin Wu <ppwwyyxx@gmail.com>
+
 
 import logging
 import tensorflow as tf
@@ -33,7 +32,7 @@ def run_test_case(case):
 if __name__ == '__main__':
     import tensorpack
     from tensorpack.utils import logger
-    from . import *
+    from . import *  # noqa
     logger.setLevel(logging.CRITICAL)
     subs = tensorpack.models._test.TestModel.__subclasses__()
     for cls in subs:

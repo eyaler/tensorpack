@@ -1,35 +1,21 @@
-# -*- coding: UTF-8 -*-
+# -*- coding: utf-8 -*-
 # File: symbolic_functions.py
-# Author: Yuxin Wu <ppwwyyxx@gmail.com>
+
 
 import tensorflow as tf
-from contextlib import contextmanager
 import numpy as np
 
 from ..utils.develop import deprecated
 
-# __all__ = ['get_scalar_var']
+__all__ = ['get_scalar_var', 'prediction_incorrect', 'flatten', 'batch_flatten', 'print_stat', 'rms', 'huber_loss']
 
 
-# this function exists for backwards-compatibilty
+# this function exists for backwards-compatibility
 def prediction_incorrect(logits, label, topk=1, name='incorrect_vector'):
-    return tf.cast(tf.logical_not(tf.nn.in_top_k(logits, label, topk)),
-                   tf.float32, name=name)
+    return tf.cast(tf.logical_not(tf.nn.in_top_k(logits, label, topk)), tf.float32, name=name)
 
 
-@deprecated("Please implement it by yourself.", "2018-02-28")
-def accuracy(logits, label, topk=1, name='accuracy'):
-    """
-    Args:
-        logits: shape [B,C].
-        label: shape [B].
-        topk(int): topk
-    Returns:
-        a single scalar
-    """
-    return tf.reduce_mean(tf.cast(tf.nn.in_top_k(logits, label, topk), tf.float32), name=name)
-
-
+@deprecated("Please implement it yourself!", "2018-08-01")
 def flatten(x):
     """
     Flatten the tensor.
@@ -37,6 +23,7 @@ def flatten(x):
     return tf.reshape(x, [-1])
 
 
+@deprecated("Please implement it yourself!", "2018-08-01")
 def batch_flatten(x):
     """
     Flatten the tensor except the first dimension.
@@ -45,54 +32,6 @@ def batch_flatten(x):
     if None not in shape:
         return tf.reshape(x, [-1, int(np.prod(shape))])
     return tf.reshape(x, tf.stack([tf.shape(x)[0], -1]))
-
-
-@deprecated("Please implement it by yourself.", "2018-02-28")
-def class_balanced_cross_entropy(pred, label, name='cross_entropy_loss'):
-    """
-    The class-balanced cross entropy loss,
-    as in `Holistically-Nested Edge Detection
-    <http://arxiv.org/abs/1504.06375>`_.
-
-    Args:
-        pred: of shape (b, ...). the predictions in [0,1].
-        label: of the same shape. the ground truth in {0,1}.
-    Returns:
-        class-balanced cross entropy loss.
-    """
-    with tf.name_scope('class_balanced_cross_entropy'):
-        z = batch_flatten(pred)
-        y = tf.cast(batch_flatten(label), tf.float32)
-
-        count_neg = tf.reduce_sum(1. - y)
-        count_pos = tf.reduce_sum(y)
-        beta = count_neg / (count_neg + count_pos)
-
-        eps = 1e-12
-        loss_pos = -beta * tf.reduce_mean(y * tf.log(z + eps))
-        loss_neg = (1. - beta) * tf.reduce_mean((1. - y) * tf.log(1. - z + eps))
-    cost = tf.subtract(loss_pos, loss_neg, name=name)
-    return cost
-
-
-@deprecated("Please implement it by yourself.", "2018-02-28")
-def class_balanced_sigmoid_cross_entropy(logits, label, name='cross_entropy_loss'):
-    """
-    This function accepts logits rather than predictions, and is more numerically stable than
-    :func:`class_balanced_cross_entropy`.
-    """
-    with tf.name_scope('class_balanced_sigmoid_cross_entropy'):
-        y = tf.cast(label, tf.float32)
-
-        count_neg = tf.reduce_sum(1. - y)
-        count_pos = tf.reduce_sum(y)
-        beta = count_neg / (count_neg + count_pos)
-
-        pos_weight = beta / (1 - beta)
-        cost = tf.nn.weighted_cross_entropy_with_logits(logits=logits, targets=y, pos_weight=pos_weight)
-        cost = tf.reduce_mean(cost * (1 - beta))
-        zero = tf.equal(count_pos, 0.0)
-    return tf.where(zero, 0.0, cost, name=name)
 
 
 def print_stat(x, message=None):
@@ -108,6 +47,8 @@ def print_stat(x, message=None):
                     message=message, name='print_' + x.op.name)
 
 
+# after deprecated, keep it for internal use only
+# @deprecated("Please implement it yourself!", "2018-08-01")
 def rms(x, name=None):
     """
     Returns:
@@ -120,7 +61,7 @@ def rms(x, name=None):
     return tf.sqrt(tf.reduce_mean(tf.square(x)), name=name)
 
 
-@deprecated("Please use tf.losses.huber_loss instead!")
+@deprecated("Please use tf.losses.huber_loss instead!", "2018-08-01")
 def huber_loss(x, delta=1, name='huber_loss'):
     r"""
     Huber loss of x.
@@ -150,6 +91,7 @@ def huber_loss(x, delta=1, name='huber_loss'):
 
 # TODO deprecate this in the future
 # doesn't hurt to keep it here for now
+@deprecated("Simply use tf.get_variable instead!", "2018-08-01")
 def get_scalar_var(name, init_value, summary=False, trainable=False):
     """
     Get a scalar float variable with certain initial value.
@@ -171,6 +113,7 @@ def get_scalar_var(name, init_value, summary=False, trainable=False):
     return ret
 
 
+@deprecated("Please implement it by yourself.", "2018-04-28")
 def psnr(prediction, ground_truth, maxp=None, name='psnr'):
     """`Peek Signal to Noise Ratio <https://en.wikipedia.org/wiki/Peak_signal-to-noise_ratio>`_.
 
@@ -203,72 +146,3 @@ def psnr(prediction, ground_truth, maxp=None, name='psnr'):
         psnr = tf.add(tf.multiply(20., log10(maxp)), psnr, name=name)
 
     return psnr
-
-
-@contextmanager
-@deprecated("Please implement it by yourself.", "2018-02-28")
-def guided_relu():
-    """
-    Returns:
-        A context where the gradient of :meth:`tf.nn.relu` is replaced by
-        guided back-propagation, as described in the paper:
-        `Striving for Simplicity: The All Convolutional Net
-        <https://arxiv.org/abs/1412.6806>`_
-    """
-    from tensorflow.python.ops import gen_nn_ops   # noqa
-
-    @tf.RegisterGradient("GuidedReLU")
-    def GuidedReluGrad(op, grad):
-        return tf.where(0. < grad,
-                        gen_nn_ops._relu_grad(grad, op.outputs[0]),
-                        tf.zeros(grad.get_shape()))
-
-    g = tf.get_default_graph()
-    with g.gradient_override_map({'Relu': 'GuidedReLU'}):
-        yield
-
-
-def saliency_map(output, input, name="saliency_map"):
-    """
-    Produce a saliency map as described in the paper:
-    `Deep Inside Convolutional Networks: Visualising Image Classification Models and Saliency Maps
-    <https://arxiv.org/abs/1312.6034>`_.
-    The saliency map is the gradient of the max element in output w.r.t input.
-
-    Returns:
-        tf.Tensor: the saliency map. Has the same shape as input.
-    """
-    max_outp = tf.reduce_max(output, 1)
-    saliency_op = tf.gradients(max_outp, input)[:][0]
-    saliency_op = tf.identity(saliency_op, name=name)
-    return saliency_op
-
-
-def shapeless_placeholder(x, axis, name):
-    """
-    Make the static shape of a tensor less specific.
-
-    If you want to feed to a tensor, the shape of the feed value must match
-    the tensor's static shape. This function creates a placeholder which
-    defaults to x if not fed, but has a less specific static shape than x.
-    See also `tensorflow#5680
-    <https://github.com/tensorflow/tensorflow/issues/5680>`_.
-
-    Args:
-        x: a tensor
-        axis(int or list of ints): these axes of ``x.get_shape()`` will become
-            None in the output.
-        name(str): name of the output tensor
-
-    Returns:
-        a tensor equal to x, but shape information is partially cleared.
-    """
-    shp = x.get_shape().as_list()
-    if not isinstance(axis, list):
-        axis = [axis]
-    for a in axis:
-        if shp[a] is None:
-            raise ValueError("Axis {} of shape {} is already unknown!".format(a, shp))
-        shp[a] = None
-    x = tf.placeholder_with_default(x, shape=shp, name=name)
-    return x

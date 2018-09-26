@@ -1,17 +1,14 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # File: base.py
-# Author: Yuxin Wu <ppwwyyxxc@gmail.com>
+
 
 from abc import abstractmethod, ABCMeta
 import tensorflow as tf
 import six
 
-from ..tfutils.common import get_tensors_by_names, get_tf_version_number
-from ..tfutils.tower import TowerContext
+from ..tfutils.common import get_tensors_by_names
+from ..tfutils.tower import PredictTowerContext
 from ..input_source import PlaceholderInput
-from ..utils.develop import log_deprecated
-from ..utils.argtools import log_once
 
 __all__ = ['PredictorBase', 'AsyncPredictorBase',
            'OnlinePredictor', 'OfflinePredictor',
@@ -25,28 +22,20 @@ class PredictorBase(object):
 
     Attributes:
         return_input (bool): whether the call will also return (inputs, outputs)
-            or just outpus
+            or just outputs
     """
 
-    def __call__(self, *args):
+    def __call__(self, *dp):
         """
         Call the predictor on some inputs.
 
-        Examples:
+        Example:
             When you have a predictor defined with two inputs, call it with:
 
             .. code-block:: python
 
                 predictor(e1, e2)
         """
-        if len(args) == 1 and isinstance(args[0], (list, tuple)):
-            dp = args[0]    # backward-compatibility
-            log_deprecated(
-                "Calling a predictor with one datapoint",
-                "Call it with positional arguments instead!",
-                "2018-3-1")
-        else:
-            dp = args
         output = self._do_call(dp)
         if self.return_input:
             return (dp, output)
@@ -93,6 +82,14 @@ class OnlinePredictor(PredictorBase):
     """ A predictor which directly use an existing session and given tensors.
     """
 
+    ACCEPT_OPTIONS = False
+    """ See Session.make_callable """
+
+    sess = None
+    """
+    The tf.Session object associated with this predictor.
+    """
+
     def __init__(self, input_tensors, output_tensors,
                  return_input=False, sess=None):
         """
@@ -102,46 +99,36 @@ class OnlinePredictor(PredictorBase):
             return_input (bool): same as :attr:`PredictorBase.return_input`.
             sess (tf.Session): the session this predictor runs in. If None,
                 will use the default session at the first call.
+                Note that in TensorFlow, default session is thread-local.
         """
         self.return_input = return_input
         self.input_tensors = input_tensors
         self.output_tensors = output_tensors
         self.sess = sess
-        self._use_callable = get_tf_version_number() >= 1.2
 
-        if self._use_callable:
-            if sess is not None:
-                self._callable = sess.make_callable(
-                    fetches=output_tensors,
-                    feed_list=input_tensors)
-            else:
-                self._callable = None
+        if sess is not None:
+            self._callable = sess.make_callable(
+                fetches=output_tensors,
+                feed_list=input_tensors,
+                accept_options=self.ACCEPT_OPTIONS)
         else:
-            log_once(
-                "TF>=1.2 is recommended for better performance of predictor!", 'warn')
-
-    def _do_call_old(self, dp):
-        feed = dict(zip(self.input_tensors, dp))
-        output = self.sess.run(self.output_tensors, feed_dict=feed)
-        return output
-
-    def _do_call_new(self, dp):
-        if self._callable is None:
-            self._callable = self.sess.make_callable(
-                fetches=self.output_tensors,
-                feed_list=self.input_tensors)
-        return self._callable(*dp)
+            self._callable = None
 
     def _do_call(self, dp):
         assert len(dp) == len(self.input_tensors), \
             "{} != {}".format(len(dp), len(self.input_tensors))
         if self.sess is None:
             self.sess = tf.get_default_session()
+            assert self.sess is not None, "Predictor isn't called under a default session!"
 
-        if self._use_callable:
-            return self._do_call_new(dp)
-        else:
-            return self._do_call_old(dp)
+        if self._callable is None:
+            self._callable = self.sess.make_callable(
+                fetches=self.output_tensors,
+                feed_list=self.input_tensors,
+                accept_options=self.ACCEPT_OPTIONS)
+        # run_metadata = tf.RunMetadata()
+        # options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
+        return self._callable(*dp)
 
 
 class OfflinePredictor(OnlinePredictor):
@@ -157,7 +144,7 @@ class OfflinePredictor(OnlinePredictor):
         with self.graph.as_default():
             input = PlaceholderInput()
             input.setup(config.inputs_desc)
-            with TowerContext('', is_training=False):
+            with PredictTowerContext(''):
                 config.tower_func(*input.get_input_tensors())
 
             input_tensors = get_tensors_by_names(config.input_names)

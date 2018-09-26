@@ -1,23 +1,18 @@
 #!/usr/bin/env python
-# -*- coding: UTF-8 -*-
+# -*- coding: utf-8 -*-
 # File: imagenet-resnet.py
 
-import sys
 import argparse
-import numpy as np
 import os
 
-import tensorflow as tf
-
-os.environ['TENSORPACK_TRAIN_API'] = 'v2'   # will become default soon
 from tensorpack import logger, QueueInput
 from tensorpack.models import *
 from tensorpack.callbacks import *
 from tensorpack.train import (
-    TrainConfig, SyncMultiGPUTrainerParameterServer, launch_train_with_config)
-from tensorpack.dataflow import imgaug, FakeData
+    TrainConfig, SyncMultiGPUTrainerReplicated, launch_train_with_config)
+from tensorpack.dataflow import FakeData
 from tensorpack.tfutils import argscope, get_model_loader
-from tensorpack.utils.gpu import get_nr_gpu
+from tensorpack.utils.gpu import get_num_gpu
 
 from imagenet_utils import (
     fbresnet_augmentor, get_imagenet_dataflow, ImageNetModel,
@@ -27,12 +22,11 @@ from resnet_model import (
     resnet_group, resnet_basicblock, resnet_bottleneck, se_resnet_bottleneck,
     resnet_backbone)
 
-TOTAL_BATCH_SIZE = 256
-
 
 class Model(ImageNetModel):
-    def __init__(self, depth, data_format='NCHW', mode='resnet'):
-        super(Model, self).__init__(data_format)
+    def __init__(self, depth, mode='resnet'):
+        if mode == 'se':
+            assert depth >= 50
 
         self.mode = mode
         basicblock = preresnet_basicblock if mode == 'preact' else resnet_basicblock
@@ -63,26 +57,38 @@ def get_data(name, batch):
 
 
 def get_config(model, fake=False):
-    nr_tower = max(get_nr_gpu(), 1)
-    batch = TOTAL_BATCH_SIZE // nr_tower
+    nr_tower = max(get_num_gpu(), 1)
+    assert args.batch % nr_tower == 0
+    batch = args.batch // nr_tower
 
+    logger.info("Running on {} towers. Batch size per tower: {}".format(nr_tower, batch))
+    if batch < 32 or batch > 64:
+        logger.warn("Batch size per tower not in [32, 64]. This probably will lead to worse accuracy than reported.")
     if fake:
-        logger.info("For benchmark, batch size is fixed to 64 per tower.")
-        dataset_train = FakeData(
-            [[64, 224, 224, 3], [64]], 1000, random=False, dtype='uint8')
+        data = QueueInput(FakeData(
+            [[batch, 224, 224, 3], [batch]], 1000, random=False, dtype='uint8'))
         callbacks = []
     else:
-        logger.info("Running on {} towers. Batch size per tower: {}".format(nr_tower, batch))
-        dataset_train = get_data('train', batch)
-        dataset_val = get_data('val', batch)
+        data = QueueInput(get_data('train', batch))
+
+        START_LR = 0.1
+        BASE_LR = START_LR * (args.batch / 256.0)
         callbacks = [
             ModelSaver(),
-            ScheduledHyperParamSetter('learning_rate',
-                                      [(30, 1e-2), (60, 1e-3), (85, 1e-4), (95, 1e-5), (105, 1e-6)]),
-            HumanHyperParamSetter('learning_rate'),
+            EstimatedTimeLeft(),
+            ScheduledHyperParamSetter(
+                'learning_rate', [
+                    (0, min(START_LR, BASE_LR)), (30, BASE_LR * 1e-1), (60, BASE_LR * 1e-2),
+                    (90, BASE_LR * 1e-3), (100, BASE_LR * 1e-4)]),
         ]
+        if BASE_LR > START_LR:
+            callbacks.append(
+                ScheduledHyperParamSetter(
+                    'learning_rate', [(0, START_LR), (5, BASE_LR)], interp='linear'))
+
         infs = [ClassificationError('wrong-top1', 'val-error-top1'),
                 ClassificationError('wrong-top5', 'val-error-top5')]
+        dataset_val = get_data('val', batch)
         if nr_tower == 1:
             # single-GPU inference with queue prefetch
             callbacks.append(InferenceRunner(QueueInput(dataset_val), infs))
@@ -93,25 +99,28 @@ def get_config(model, fake=False):
 
     return TrainConfig(
         model=model,
-        dataflow=dataset_train,
+        data=data,
         callbacks=callbacks,
-        steps_per_epoch=5000,
-        max_epoch=110,
-        nr_tower=nr_tower
+        steps_per_epoch=100 if args.fake else 1281167 // args.batch,
+        max_epoch=105,
     )
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--gpu', help='comma separated list of GPU(s) to use.')
+    parser.add_argument('--gpu', help='comma separated list of GPU(s) to use. Default to use all available ones')
     parser.add_argument('--data', help='ILSVRC dataset dir')
-    parser.add_argument('--load', help='load model')
-    parser.add_argument('--fake', help='use fakedata to test or benchmark this model', action='store_true')
-    parser.add_argument('--data_format', help='specify NCHW or NHWC',
-                        type=str, default='NCHW')
-    parser.add_argument('-d', '--depth', help='resnet depth',
-                        type=int, default=18, choices=[18, 34, 50, 101, 152])
-    parser.add_argument('--eval', action='store_true')
+    parser.add_argument('--load', help='load a model for training or evaluation')
+    parser.add_argument('--fake', help='use FakeData to debug or benchmark this model', action='store_true')
+    parser.add_argument('--data-format', help='image data format',
+                        default='NCHW', choices=['NCHW', 'NHWC'])
+    parser.add_argument('-d', '--depth', help='ResNet depth',
+                        type=int, default=50, choices=[18, 34, 50, 101, 152])
+    parser.add_argument('--eval', action='store_true', help='run offline evaluation instead of training')
+    parser.add_argument('--batch', default=256, type=int,
+                        help="total batch size. "
+                        "Note that it's best to keep per-GPU batch size in [32, 64] to obtain the best accuracy."
+                        "Pretrained models listed in README were trained with batch=32x8.")
     parser.add_argument('--mode', choices=['resnet', 'preact', 'se'],
                         help='variants of resnet to use', default='resnet')
     args = parser.parse_args()
@@ -119,20 +128,21 @@ if __name__ == '__main__':
     if args.gpu:
         os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
 
-    if args.mode == 'se':
-        assert args.depth >= 50
-
-    model = Model(args.depth, args.data_format, args.mode)
+    model = Model(args.depth, args.mode)
+    model.data_format = args.data_format
     if args.eval:
         batch = 128    # something that can run on one gpu
         ds = get_data('val', batch)
         eval_on_ILSVRC12(model, get_model_loader(args.load), ds)
     else:
-        logger.set_logger_dir(
-            os.path.join('train_log', 'imagenet-resnet-d' + str(args.depth)))
+        if args.fake:
+            logger.set_logger_dir(os.path.join('train_log', 'tmp'), 'd')
+        else:
+            logger.set_logger_dir(
+                os.path.join('train_log', 'imagenet-{}-d{}-batch{}'.format(args.mode, args.depth, args.batch)))
 
         config = get_config(model, fake=args.fake)
         if args.load:
             config.session_init = get_model_loader(args.load)
-        trainer = SyncMultiGPUTrainerParameterServer(max(get_nr_gpu(), 1))
+        trainer = SyncMultiGPUTrainerReplicated(max(get_num_gpu(), 1))
         launch_train_with_config(config, trainer)

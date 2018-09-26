@@ -6,12 +6,11 @@ import argparse
 import numpy as np
 import tensorflow as tf
 import cv2
-import os
 from scipy.signal import convolve2d
 from six.moves import range, zip
 import multiprocessing
 
-os.environ['TENSORPACK_TRAIN_API'] = 'v2'   # will become default soon
+
 from tensorpack import *
 from tensorpack.utils import logger
 from tensorpack.utils.viz import *
@@ -96,11 +95,11 @@ class OnlineTensorboardExport(Callback):
 
 
 class Model(ModelDesc):
-    def _get_inputs(self):
-        return [InputDesc(tf.float32, (BATCH, ), 'theta'),
-                InputDesc(tf.float32, (BATCH, SHAPE, SHAPE), 'image'),
-                InputDesc(tf.float32, (BATCH, SHAPE, SHAPE), 'gt_image'),
-                InputDesc(tf.float32, (BATCH, 9, 9), 'gt_filter')]
+    def inputs(self):
+        return [tf.placeholder(tf.float32, (BATCH, ), 'theta'),
+                tf.placeholder(tf.float32, (BATCH, SHAPE, SHAPE), 'image'),
+                tf.placeholder(tf.float32, (BATCH, SHAPE, SHAPE), 'gt_image'),
+                tf.placeholder(tf.float32, (BATCH, 9, 9), 'gt_filter')]
 
     def _parameter_net(self, theta, kernel_shape=9):
         """Estimate filters for convolution layers
@@ -112,8 +111,7 @@ class Model(ModelDesc):
         Returns:
             learned filter as [B, k, k, 1]
         """
-        with argscope(LeakyReLU, alpha=0.2), \
-                argscope(FullyConnected, nl=LeakyReLU):
+        with argscope(FullyConnected, nl=tf.nn.leaky_relu):
             net = FullyConnected('fc1', theta, 64)
             net = FullyConnected('fc2', net, 128)
 
@@ -122,12 +120,8 @@ class Model(ModelDesc):
         logger.info('Parameter net output: {}'.format(pred_filter.get_shape().as_list()))
         return pred_filter
 
-    def _build_graph(self, inputs):
+    def build_graph(self, theta, image, gt_image, gt_filter):
         kernel_size = 9
-        theta, image, gt_image, gt_filter = inputs
-
-        image = image
-        gt_image = gt_image
 
         theta = tf.reshape(theta, [BATCH, 1, 1, 1]) - np.pi
         image = tf.reshape(image, [BATCH, SHAPE, SHAPE, 1])
@@ -145,10 +139,11 @@ class Model(ModelDesc):
         tf.summary.image('pred_gt_filters', filters, max_outputs=20)
         tf.summary.image('pred_gt_images', images, max_outputs=20)
 
-        self.cost = tf.reduce_mean(tf.squared_difference(pred_image, gt_image), name="cost")
-        summary.add_moving_summary(self.cost)
+        cost = tf.reduce_mean(tf.squared_difference(pred_image, gt_image), name="cost")
+        summary.add_moving_summary(cost)
+        return cost
 
-    def _get_optimizer(self):
+    def optimizer(self):
         return tf.train.AdamOptimizer(1e-3)
 
 
@@ -216,8 +211,8 @@ class ThetaImages(ProxyDataFlow, RNGDataFlow):
         ProxyDataFlow.reset_state(self)
         RNGDataFlow.reset_state(self)
 
-    def get_data(self):
-        for image, label in self.ds.get_data():
+    def __iter__(self):
+        for image, label in self.ds:
             theta = self.rng.uniform(0, 2 * np.pi)
             filtered_image, gt_filter = ThetaImages.filter_with_theta(image, theta)
             yield [theta, image, filtered_image, gt_filter]
@@ -247,7 +242,7 @@ def get_config():
             OnlineTensorboardExport()
         ],
         model=Model(),
-        steps_per_epoch=dataset_train.size(),
+        steps_per_epoch=len(dataset_train),
         max_epoch=50,
     )
 
@@ -259,8 +254,8 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     with change_gpu(args.gpu):
-        NR_GPU = len(args.gpu.split(','))
+        NGPU = len(args.gpu.split(','))
         config = get_config()
         if args.load:
             config.session_init = SaverRestore(args.load)
-        launch_train_with_config(config, SyncMultiGPUTrainer(NR_GPU))
+        launch_train_with_config(config, SyncMultiGPUTrainer(NGPU))

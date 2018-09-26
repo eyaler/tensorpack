@@ -1,11 +1,10 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # Author: Your Name <your@email.com>
 
 import os
 import argparse
 import tensorflow as tf
-os.environ['TENSORPACK_TRAIN_API'] = 'v2'   # will become default soon
+
 from tensorpack import *
 
 """
@@ -19,18 +18,17 @@ CHANNELS = 3
 
 
 class Model(ModelDesc):
-    def _get_inputs(self):
-        return [InputDesc(tf.float32, (None, SHAPE, SHAPE, CHANNELS), 'input'),
-                InputDesc(tf.int32, (None,), 'label')]
+    def inputs(self):
+        return [tf.placeholder(tf.float32, (None, SHAPE, SHAPE, CHANNELS), 'input1'),
+                tf.placeholder(tf.int32, (None,), 'input2')]
 
-    def _build_graph(self, inputs):
-        image, label = inputs
-        image = image * 2 - 1
+    def build_graph(self, input1, input2):
 
-        self.cost = tf.identity(0., name='total_costs')
-        summary.add_moving_summary(self.cost)
+        cost = tf.identity(input1 - input2, name='total_costs')
+        summary.add_moving_summary(cost)
+        return cost
 
-    def _get_optimizer(self):
+    def optimizer(self):
         lr = tf.get_variable('learning_rate', initializer=5e-3, trainable=False)
         return tf.train.AdamOptimizer(lr)
 
@@ -57,7 +55,7 @@ def get_config():
             ModelSaver(),
             InferenceRunner(ds_test, [ScalarStats('total_costs')]),
         ],
-        steps_per_epoch=ds_train.size(),
+        steps_per_epoch=len(ds_train),
         max_epoch=100,
     )
 

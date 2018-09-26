@@ -1,7 +1,6 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # File: raw.py
-# Author: Yuxin Wu <ppwwyyxxc@gmail.com>
+
 
 import numpy as np
 import copy
@@ -10,7 +9,7 @@ from six.moves import range
 from .base import DataFlow, RNGDataFlow
 from ..utils.develop import log_deprecated
 
-__all__ = ['FakeData', 'DataFromQueue', 'DataFromList', 'DataFromGenerator']
+__all__ = ['FakeData', 'DataFromQueue', 'DataFromList', 'DataFromGenerator', 'DataFromIterable']
 
 
 class FakeData(RNGDataFlow):
@@ -35,10 +34,10 @@ class FakeData(RNGDataFlow):
         assert len(self.dtype) == len(self.shapes)
         assert len(self.domain) == len(self.domain)
 
-    def size(self):
+    def __len__(self):
         return self._size
 
-    def get_data(self):
+    def __iter__(self):
         if self.random:
             for _ in range(self._size):
                 val = []
@@ -64,28 +63,28 @@ class DataFromQueue(DataFlow):
         """
         self.queue = queue
 
-    def get_data(self):
+    def __iter__(self):
         while True:
             yield self.queue.get()
 
 
 class DataFromList(RNGDataFlow):
-    """ Produce data from a list"""
+    """ Wrap a list of datapoints to a DataFlow"""
 
     def __init__(self, lst, shuffle=True):
         """
         Args:
-            lst (list): input list.
+            lst (list): input list. Each element is a datapoint.
             shuffle (bool): shuffle data.
         """
         super(DataFromList, self).__init__()
         self.lst = lst
         self.shuffle = shuffle
 
-    def size(self):
+    def __len__(self):
         return len(self.lst)
 
-    def get_data(self):
+    def __iter__(self):
         if not self.shuffle:
             for k in self.lst:
                 yield k
@@ -104,15 +103,34 @@ class DataFromGenerator(DataFlow):
         """
         Args:
             gen: iterable, or a callable that returns an iterable
+            size: deprecated
         """
         if not callable(gen):
             self._gen = lambda: gen
         else:
             self._gen = gen
         if size is not None:
-            log_deprecated("DataFromGenerator(size=)", "It doesn't make much sense.")
+            log_deprecated("DataFromGenerator(size=)", "It doesn't make much sense.", "2018-03-31")
 
-    def get_data(self):
+    def __iter__(self):
         # yield from
         for dp in self._gen():
+            yield dp
+
+
+class DataFromIterable(DataFlow):
+    """ Wrap an iterable of datapoints to a DataFlow"""
+    def __init__(self, iterable):
+        """
+        Args:
+            iterable: an iterable object with length
+        """
+        self._itr = iterable
+        self._len = len(iterable)
+
+    def __len__(self):
+        return self._len
+
+    def __iter__(self):
+        for dp in self._itr:
             yield dp

@@ -1,7 +1,6 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # File: input_source.py
-# Author: Yuxin Wu <ppwwyyxxc@gmail.com>
+
 
 import tensorflow as tf
 try:
@@ -9,66 +8,85 @@ try:
 except ImportError:
     pass
 
+from contextlib import contextmanager
 from itertools import chain
 from six.moves import range, zip
 import threading
 
 from .input_source_base import InputSource
-from ..dataflow import DataFlow, RepeatedData, DataFlowTerminated
+from ..dataflow import DataFlow, MapData, RepeatedData, DataFlowTerminated
 from ..tfutils.summary import add_moving_summary
 from ..tfutils.common import get_op_tensor_name
 from ..tfutils.tower import get_current_tower_context
+from ..tfutils.dependency import dependency_of_fetches
 from ..utils import logger
 from ..utils.concurrency import ShareSessionThread
-from ..utils.develop import log_deprecated
-from ..callbacks.base import Callback
+from ..callbacks.base import Callback, CallbackFactory
 from ..callbacks.graph import RunOp
 
-__all__ = ['PlaceholderInput', 'FeedInput',
-           'FeedfreeInput',
+__all__ = ['PlaceholderInput', 'FeedInput', 'FeedfreeInput',
            'QueueInput', 'BatchQueueInput',
            'DummyConstantInput', 'TensorInput',
-           'TFDatasetInput',
-           'StagingInputWrapper',
+           'ZMQInput', 'TFDatasetInput',
            'StagingInput']
+
+
+def _get_reset_callback(df):
+    return CallbackFactory(setup_graph=lambda _: df.reset_state())
+
+
+def _make_feeds(placeholders, datapoint):
+    assert len(datapoint) == len(placeholders), \
+        "Size of datapoint and placeholders are different: {} != {}".format(
+            len(datapoint), len(placeholders))
+
+    if isinstance(datapoint, (list, tuple)):
+        return dict(zip(placeholders, datapoint))
+    elif isinstance(datapoint, dict):
+        ret = {p: datapoint[p.op.name] for p in placeholders}
+        return ret
+    else:
+        raise TypeError("Got a datapoint of type {}!".format(type(datapoint)))
 
 
 class PlaceholderInput(InputSource):
     """
     Just produce placeholders as input tensors.
     """
-    def __init__(self, prefix=''):
-        """
-        Args:
-            prefix(str): an optional prefix to add to the placeholder.
-        """
-        self._prefix = prefix
+    def __init__(self):
+        pass
 
     def _setup(self, inputs):
-        self._all_placehdrs = [v.build_placeholder(prefix=self._prefix) for v in inputs]
+        self._all_placehdrs = [v.build_placeholder_reuse() for v in inputs]
 
     def _get_input_tensors(self):
         return self._all_placehdrs
 
 
 class FeedInput(InputSource):
-    """ Input by iterating over a DataFlow and feed datapoints. """
+    """
+    Input by iterating over a DataFlow and feed datapoints.
+
+    Note:
+        If `get_input_tensors()` is called more than one time, it will return the same placeholders (i.e. feed points)
+        as the first time.
+        Therefore you can't use it for data-parallel training.
+    """
 
     class _FeedCallback(Callback):
         def __init__(self, ds, placeholders):
             self._ds = ds
-            self._itr = self._ds.get_data()
+            self._itr = self._ds.__iter__()
             self._placeholders = placeholders
 
         def _before_run(self, _):
             dp = next(self._itr)
             assert len(dp) == len(self._placeholders), "[FeedInput] datapoints and inputs are of different length!"
-            feed = dict(zip(self._placeholders, dp))
+            feed = _make_feeds(self._placeholders, dp)
             return tf.train.SessionRunArgs(fetches=[], feed_dict=feed)
 
         def _reset(self):
-            self._ds.reset_state()
-            self._itr = self._ds.get_data()
+            self._itr = self._ds.__iter__()
 
     def __init__(self, ds, infinite=True):
         """
@@ -77,7 +95,8 @@ class FeedInput(InputSource):
             infinite (bool): When set to False, will raise StopIteration when
                 ds is exhausted.
         """
-        assert isinstance(ds, DataFlow), ds
+        if not isinstance(ds, DataFlow):
+            raise ValueError("FeedInput takes a DataFlow! Got {}".format(ds))
         self.ds = ds
         if infinite:
             self._iter_ds = RepeatedData(self.ds, -1)
@@ -85,7 +104,7 @@ class FeedInput(InputSource):
             self._iter_ds = self.ds
 
     def _size(self):
-        return self.ds.size()
+        return len(self.ds)
 
     def _setup(self, inputs):
         # placeholders as input are always safe to reuse.
@@ -99,7 +118,7 @@ class FeedInput(InputSource):
         self._cb._reset()
 
     def _get_callbacks(self):
-        return [self._cb]
+        return [self._cb, _get_reset_callback(self._iter_ds)]
 
 
 class FeedfreeInput(InputSource):
@@ -110,34 +129,35 @@ class FeedfreeInput(InputSource):
         pass
 
 
-# TODO enqueu_many? https://github.com/tensorflow/tensorflow/issues/7817#issuecomment-282053155
+# TODO enqueue_many? https://github.com/tensorflow/tensorflow/issues/7817#issuecomment-282053155
 class EnqueueThread(ShareSessionThread):
     def __init__(self, queue, ds, placehdrs):
         super(EnqueueThread, self).__init__()
         self.name = 'EnqueueThread ' + queue.name
         self.daemon = True
-
-        self.dataflow = RepeatedData(ds, -1)
+        self.dataflow = ds
         self.queue = queue
-
         self.placehdrs = placehdrs
 
         self.op = self.queue.enqueue(self.placehdrs)
         self.close_op = self.queue.close(cancel_pending_enqueues=True)
 
-        self._lock = threading.Lock()
+        self._running = threading.Event()
+        self._running.set()
+        # self._size = queue.size()
 
     def run(self):
         with self.default_sess():
             try:
-                self.reset_dataflow()
+                self.reinitialize_dataflow()
                 while True:
                     # pausable loop
-                    self._lock.acquire()
-                    self._lock.release()
+                    if not self._running.is_set():
+                        self._running.wait()
 
                     dp = next(self._itr)
-                    feed = dict(zip(self.placehdrs, dp))
+                    feed = _make_feeds(self.placehdrs, dp)
+                    # _, sz = sess.run([self.op, self._sz], feed_dict=feed)
                     self.op.run(feed_dict=feed)
             except (tf.errors.CancelledError, tf.errors.OutOfRangeError, DataFlowTerminated):
                 pass
@@ -153,15 +173,14 @@ class EnqueueThread(ShareSessionThread):
                     pass
                 logger.info("{} Exited.".format(self.name))
 
-    def reset_dataflow(self):
-        self.dataflow.reset_state()
-        self._itr = self.dataflow.get_data()
+    def reinitialize_dataflow(self):
+        self._itr = self.dataflow.__iter__()
 
     def pause(self):
-        self._lock.acquire()
+        self._running.clear()
 
     def resume(self):
-        self._lock.release()
+        self._running.set()
 
 
 class QueueInput(FeedfreeInput):
@@ -179,12 +198,15 @@ class QueueInput(FeedfreeInput):
                 should match the corresponding InputDesc of the model.
                 Defaults to a FIFO queue of size 50.
         """
-        assert isinstance(ds, DataFlow), ds
+        if not isinstance(ds, DataFlow):
+            raise ValueError("QueueInput takes a DataFlow! Got {}".format(ds))
         self.queue = queue
         self.ds = ds
+        self._inf_ds = RepeatedData(ds, -1)
+        self._started = False
 
     def _size(self):
-        return self.ds.size()
+        return len(self.ds)
 
     def _setup(self, inputs):
         self._input_placehdrs = [v.build_placeholder_reuse() for v in inputs]
@@ -196,11 +218,14 @@ class QueueInput(FeedfreeInput):
                     50, [x.dtype for x in self._input_placehdrs],
                     name='input_queue')
             logger.info("Setting up the queue '{}' for CPU prefetching ...".format(self.queue.name))
-            self.thread = EnqueueThread(self.queue, self.ds, self._input_placehdrs)
+            self.thread = EnqueueThread(self.queue, self._inf_ds, self._input_placehdrs)
 
             self._dequeue_op = self.queue.dequeue(name='dequeue_for_reset')
 
-    def _reset_state(self):
+    def refill_queue(self):
+        """
+        Clear the queue, then call dataflow.__iter__() again and fill into the queue.
+        """
         self.thread.pause()     # pause enqueue
 
         opt = tf.RunOptions()
@@ -214,7 +239,7 @@ class QueueInput(FeedfreeInput):
             pass
 
         # reset dataflow, start thread
-        self.thread.reset_dataflow()
+        self.thread.reinitialize_dataflow()
         self.thread.resume()
 
     def _create_ema_callback(self):
@@ -225,7 +250,7 @@ class QueueInput(FeedfreeInput):
         with self.cached_name_scope():
             # in TF there is no API to get queue capacity, so we can only summary the size
             size = tf.cast(self.queue.size(), tf.float32, name='queue_size')
-        size_ema_op = add_moving_summary(size, collection=None)[0].op
+        size_ema_op = add_moving_summary(size, collection=None, decay=0.5)[0].op
         return RunOp(
             lambda: size_ema_op,
             run_before=False,
@@ -235,8 +260,7 @@ class QueueInput(FeedfreeInput):
     def _get_callbacks(self):
         from ..callbacks.concurrency import StartProcOrThread
         cb = StartProcOrThread(self.thread)
-        cb.chief_only = False
-        return [cb, self._create_ema_callback()]
+        return [cb, self._create_ema_callback(), _get_reset_callback(self._inf_ds)]
 
     def _get_input_tensors(self):
         with tf.device('/cpu:0'), self.cached_name_scope():
@@ -267,7 +291,7 @@ class BatchQueueInput(QueueInput):
         self.batch_size = int(batch_size)
 
     def _size(self):
-        return self.ds.size() // self.batch_size
+        return len(self.ds) // self.batch_size
 
     def _setup(self, inputs):
         logger.info("Setting up the queue for CPU prefetching ...")
@@ -299,7 +323,7 @@ class BatchQueueInput(QueueInput):
             for shp in self.queue.shapes:
                 assert shp.is_fully_defined(), shape_err
 
-            self.thread = EnqueueThread(self.queue, self.ds, placehdrs_nobatch)
+            self.thread = EnqueueThread(self.queue, self._inf_ds, placehdrs_nobatch)
 
     def _get_input_tensors(self):
         with tf.device('/cpu:0'), self.cached_name_scope():
@@ -316,17 +340,21 @@ class BatchQueueInput(QueueInput):
 
 # TODO tensor inputs can be drained? look at the new dataset API.
 class TensorInput(FeedfreeInput):
-    """ Input from a list of tensors, e.g. a TF data reading pipeline.
+    """ Use inputs from a list of tensors, e.g. a TF data reading pipeline.
         The PTB training example shows how to use it.
     """
 
     def __init__(self, get_tensor_fn, size=None):
         """
         Args:
-            get_tensor_fn: a function which returns a list of input tensors
-                when called. It will be called under a TowerContext.
+            get_tensor_fn ( -> [tf.Tensor]): a function which returns a list of input tensors
+                (for example, [image, label]) when called.
+                It will be called under a TowerContext and should return the inputs to be used in that tower.
+                The returned tensors will be evaluated every iteration, it's your job to make sure it's possible.
             size(int): size of this input. Use None to leave it undefined.
         """
+        if not callable(get_tensor_fn):
+            raise ValueError("get_tensor_fn has to be a function! Got {}".format(get_tensor_fn))
         self.get_tensor_fn = get_tensor_fn
         if size is not None:
             size = int(size)
@@ -344,17 +372,19 @@ class TensorInput(FeedfreeInput):
     def _get_input_tensors(self):
         with self.cached_name_scope():
             ret = self.get_tensor_fn()
-        assert len(ret) == len(self._desc), "{} != {}".format(len(ret), len(self._desc))
+        assert isinstance(ret, (list, tuple)), "get_tensor_fn needs to return a list!"
+        assert len(ret) == len(self._desc), \
+            "get_tensor_fn returns {} tensors but there are {} inputs".format(len(ret), len(self._desc))
         return ret
 
 
 class DummyConstantInput(TensorInput):
-    """ Input with some random tensor placed on GPU.
+    """ Input with a constant zero tensor placed on GPU.
         Useful for debugging performance issues """
     def __init__(self, shapes):
         """
         Args:
-            shapes (list[list]): a list of fully-sepcified shapes.
+            shapes (list[list]): a list of fully-specified shapes.
         """
         self.shapes = shapes
         logger.warn("Using dummy input for debug!")
@@ -375,32 +405,43 @@ class DummyConstantInput(TensorInput):
 
 class ZMQInput(TensorInput):
     """
-    Not well implemented yet. Don't use.
+    Receive tensors from a ZMQ endpoint, with ops from https://github.com/tensorpack/zmq_ops.
+    It works with :func:`dataflow.remote.send_dataflow_zmq(format='zmq_ops')`.
     """
-    def __init__(self, endpoint):
-        self._endpoint = endpoint
-
-        from tensorpack.user_ops import zmq_recv
+    def __init__(self, end_point, hwm, bind=True):
+        """
+        Args:
+            end_point (str): the ZMQ endpoint
+            hwm (int): the ZMQ high-water-mark
+        """
+        self._end_point = end_point
+        self._hwm = int(hwm)
+        self._bind = bind
 
         def fn():
-            ret = zmq_recv(self._endpoint, [x.dtype for x in self.inputs_desc])
-            if isinstance(ret, tf.Tensor):
-                ret = [ret]
-            assert len(ret) == len(self.inputs_desc)
-            for qv, v in zip(ret, self.inputs_desc):
+            ret = self._zmq_pull_socket.pull()
+            assert len(ret) == len(self._desc)
+            for qv, v in zip(ret, self._desc):
                 qv.set_shape(v.shape)
             return ret
         super(ZMQInput, self).__init__(fn)
 
     def _setup(self, inputs_desc):
-        self.inputs_desc = inputs_desc
-        assert len(self.inputs_desc) > 0, \
+        assert len(inputs_desc) > 0, \
             "ZMQInput has to be used with InputDesc!"
+        self._desc = inputs_desc
+
+        import zmq_ops
+        self._zmq_pull_socket = zmq_ops.ZMQPullSocket(
+            self._end_point,
+            [x.type for x in inputs_desc],
+            hwm=self._hwm,
+            bind=self._bind)
 
 
 class TFDatasetInput(FeedfreeInput):
     """
-    Use a :class:`tf.contrib.data.Dataset` instance as input.
+    Use a :class:`tf.data.Dataset` instance as input.
 
     Note:
         In training, the dataset should be infinite (use :func:`repeat()`).
@@ -408,8 +449,10 @@ class TFDatasetInput(FeedfreeInput):
     def __init__(self, dataset):
         """
         Args:
-            dataset (tf.contrib.data.Dataset):
+            dataset (tf.data.Dataset):
         """
+        if not isinstance(dataset, tf.data.Dataset):
+            raise ValueError("TFDatasetInput takes a tf.data.Dataset! Got {}".format(dataset))
         self._dataset = dataset
 
     def _setup(self, inputs_desc):
@@ -436,104 +479,189 @@ class TFDatasetInput(FeedfreeInput):
         self._init_op.run()
 
     def _get_input_tensors(self):
-        return self._iterator.get_next()
+        desc_shapes = [k.shape for k in self._desc]
+        ret = self._iterator.get_next()
+        assert len(ret) == len(desc_shapes), \
+            "Dataset returns {} tensors but there are {} inputs!".format(len(ret), len(desc_shapes))
+        for t, shp in zip(ret, desc_shapes):
+            t.set_shape(shp)
+        return ret
+
+    @staticmethod
+    def dataflow_to_dataset(df, types):
+        """
+        Wrap a dataflow to tf.data.Dataset.
+        This function will also reset the dataflow.
+
+        If the dataflow itself is finite, the returned dataset is also finite.
+        Therefore, if used for training, you'll need to add `.repeat()` on the returned
+        dataset.
+
+        Args:
+            df (DataFlow): a dataflow which produces lists
+            types([tf.DType]): list of types
+
+        Returns:
+            (tf.data.Dataset)
+        """
+        # TODO theoretically it can support dict
+        assert isinstance(df, DataFlow), df
+        assert isinstance(types, (list, tuple)), types
+        df = MapData(df, lambda dp: tuple(dp))
+        df.reset_state()
+        ds = tf.data.Dataset.from_generator(
+            df.get_data, tuple(types))
+        return ds
 
 
 class StagingInput(FeedfreeInput):
     """
     A wrapper around a feedfree input,
     to prefetch the input in StagingArea (on GPUs).
+
+    It works by registering hooks to put & get tensors into the StagingArea.
+    If `get_input_tensors` gets called multiple times,
+    it requires that all outputs ever produced by this InputSource will be fetched together.
+
+    This means that in multi-GPU training, you should ensure that each call on `hooked_sess.run`
+    depends on either all input tensors on all GPUs, or no input tensors at all.
+    As a result you cannot use this InputSource for :class:`InferenceRunner`.
+
+    More than one StagingInput cannot be used together.
     """
     class StagingCallback(Callback):
         """
         A callback registered by this input source, to make sure stage/unstage
         is run at each step.
         """
-        def __init__(self, stage_op, unstage_op, nr_stage):
+        def __init__(self, input, nr_stage):
             self.nr_stage = nr_stage
-            self.stage_op = stage_op
-            self.fetches = tf.train.SessionRunArgs(
-                fetches=[stage_op, unstage_op])
+            self._input = input
             self._initialized = False
 
+        def _setup_graph(self):
+            self.stage_op = self._input._get_stage_op()
+            unstage_ops = self._input._get_unstage_ops()
+            unstage_op = tf.group(*unstage_ops, name='unstage_all')
+            self._check_dependency_op = unstage_ops[0]
+            self.fetches = tf.train.SessionRunArgs(
+                fetches=[self.stage_op, unstage_op])
+
         def _prefill(self):
-            logger.info("Pre-filling staging area ...")
+            logger.info("Pre-filling StagingArea ...")
             for k in range(self.nr_stage):
                 self.stage_op.run()
+            logger.info("{} element{} put into StagingArea on each tower.".format(
+                self.nr_stage, "s were" if self.nr_stage > 1 else " was"))
 
         def _before_run(self, ctx):
             # This has to happen once, right before the first iteration.
+            # doing it in `before_train` may not work because QueueInput happens in before_train.
             if not self._initialized:
                 self._initialized = True
                 self._prefill()
-            return self.fetches
+            # Only step the stagingarea when the input is evaluated in this sess.run
+            fetches = ctx.original_args.fetches
+            if dependency_of_fetches(fetches, self._check_dependency_op):
+                # note: this disable nesting of StagingInput
+                return self.fetches
 
-    def __init__(self, input, towers, nr_stage=5):
+    def __init__(self, input, nr_stage=1, device=None):
         """
         Args:
             input (FeedfreeInput):
-            towers ([int]): list of GPU ids to prefetch on.
-            nr_stage: number of elements to prefetch on each GPU.
+            nr_stage (int): number of elements to prefetch into each StagingArea, at the beginning.
+                Since enqueue and dequeue are synchronized, prefetching 1 element should be sufficient.
+            device (str or None): if not None, place the StagingArea on a specific device. e.g., '/cpu:0'.
+                Otherwise, they are placed under where `get_inputs_tensors`
+                gets called, which could be unspecified in case of simple trainers.
         """
-        assert isinstance(input, FeedfreeInput), input
+        if not isinstance(input, FeedfreeInput):
+            raise ValueError("StagingInput takes a FeedfreeInput! Got {}".format(input))
+        if isinstance(input, StagingInput):
+            raise ValueError("StagingInput cannot be nested!")
+
         self._input = input
-        if not isinstance(towers[0], int):
-            # API changed
-            log_deprecated("StagingInput(devices=)", "Use (towers=) instead!", "2018-01-31")
-            self._devices = towers
-        else:
-            self._devices = ['/gpu:{}'.format(k) for k in towers]
 
         self._nr_stage = nr_stage
         self._areas = []
         self._stage_ops = []
         self._unstage_ops = []
+        self._device = device
 
     def _setup(self, inputs):
         self._input.setup(inputs)
-        self._setup_staging_areas()
+        with self.cached_name_scope():
+            pass    # just to cache the correct ns to use
 
     def _get_callbacks(self):
         cbs = self._input.get_callbacks()
 
+        # this callback has to happen after others, so StagingInput can be stacked together
         cbs.append(
-            StagingInput.StagingCallback(
-                self._get_stage_op(), self._get_unstage_op(), self._nr_stage))
+            StagingInput.StagingCallback(self, self._nr_stage))
         return cbs
-
-    def _setup_staging_areas(self):
-        logger.info("Setting up StagingArea for GPU prefetching ...")
-        with self.cached_name_scope():
-            for idx, device in enumerate(self._devices):
-                with tf.device(device):
-                    inputs = self._input.get_input_tensors()
-                    dtypes = [x.dtype for x in inputs]
-                    stage = StagingArea(dtypes, shapes=None)
-                    self._stage_ops.append(stage.put(inputs))
-                    self._areas.append(stage)
-                    outputs = stage.get()
-                    if isinstance(outputs, tf.Tensor):  # when size=1, TF doesn't return a list
-                        outputs = [outputs]
-                    for vin, vout in zip(inputs, outputs):
-                        vout.set_shape(vin.get_shape())
-                    self._unstage_ops.append(outputs)
 
     def _size(self):
         return self._input.size()
 
+    @contextmanager
+    def _device_ctx(self):
+        if not self._device:
+            yield
+        else:
+            with tf.device(self._device):
+                yield
+
     def _get_input_tensors(self):
-        ctx = get_current_tower_context()
-        ret = self._unstage_ops[ctx.index]
-        return ret
+        inputs = self._input.get_input_tensors()
+
+        with self._device_ctx():
+            with self.cached_name_scope():
+                # Putting variables to stagingarea will cause trouble
+                dtypes = []
+                for idx in range(len(inputs)):
+                    dtype = inputs[idx].dtype
+                    if dtype.base_dtype != dtype:     # is reference type
+                        inputs[idx] = tf.identity(inputs[idx])
+                    dtypes.append(dtype.base_dtype)
+
+                # TODO tensorflow/benchmarks use static shapes here,
+                # though it doesn't seem to help. We can use it when it's known.
+                # Setting capacity to 1 to potentially save some memory, because we should
+                # expect the consumers to run slower than the producer.
+                stage = StagingArea(dtypes, shapes=None, capacity=1)
+
+            # put & get automatically inherit the name scope from the area
+            self._stage_ops.append(stage.put(inputs))
+            self._areas.append(stage)
+            outputs = stage.get()
+            if isinstance(outputs, tf.Tensor):  # when size=1, TF doesn't return a list
+                outputs = [outputs]
+
+            for vin, vout in zip(inputs, outputs):
+                vout.set_shape(vin.get_shape())
+            self._unstage_ops.append(outputs)
+            # self._size_ops.append(stage.size())
+            return outputs
 
     def _get_stage_op(self):
         with self.cached_name_scope():
             return tf.group(*self._stage_ops)
 
-    def _get_unstage_op(self):
+    def _get_unstage_ops(self):
         with self.cached_name_scope():
             all_outputs = list(chain.from_iterable(self._unstage_ops))
-            return tf.group(*all_outputs)
+            return all_outputs
 
-
-StagingInputWrapper = StagingInput
+    # for debugging only
+    def _create_ema_callback(self):
+        def create_ema_op():
+            with self.cached_name_scope():
+                avg_size = tf.truediv(tf.add_n(self._size_ops), len(self._size_ops), name='avg_stagingarea_size')
+                return add_moving_summary(avg_size, collection=None)[0].op
+        return RunOp(
+            create_ema_op,
+            run_before=False,
+            run_as_trigger=False,
+            run_step=True)

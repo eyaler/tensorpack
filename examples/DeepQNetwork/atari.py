@@ -1,10 +1,8 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # File: atari.py
-# Author: Yuxin Wu <ppwwyyxxc@gmail.com>
+# Author: Yuxin Wu
 
 import numpy as np
-import time
 import os
 import cv2
 import threading
@@ -13,7 +11,6 @@ from six.moves import range
 from tensorpack.utils import logger
 from tensorpack.utils.utils import get_rng, execute_only_once
 from tensorpack.utils.fs import get_dataset_path
-from tensorpack.utils.stats import StatCounter
 
 import gym
 from gym import spaces
@@ -86,7 +83,6 @@ class AtariPlayer(gym.Env):
             self.viz = viz
             if self.viz and isinstance(self.viz, float):
                 self.windowname = os.path.basename(rom_file)
-                cv2.startWindowThread()
                 cv2.namedWindow(self.windowname)
 
             self.ale.loadROM(rom_file.encode('utf-8'))
@@ -99,7 +95,7 @@ class AtariPlayer(gym.Env):
 
         self.action_space = spaces.Discrete(len(self.actions))
         self.observation_space = spaces.Box(
-            low=0, high=255, shape=(self.height, self.width))
+            low=0, high=255, shape=(self.height, self.width, 1), dtype=np.uint8)
         self._restart_episode()
 
     def get_action_meanings(self):
@@ -114,7 +110,7 @@ class AtariPlayer(gym.Env):
 
     def _current_state(self):
         """
-        :returns: a gray-scale (h, w) uint8 image
+        :returns: a gray-scale (h, w, 1) uint8 image
         """
         ret = self._grab_raw_image()
         # max-pooled over the last screen
@@ -122,10 +118,10 @@ class AtariPlayer(gym.Env):
         if self.viz:
             if isinstance(self.viz, float):
                 cv2.imshow(self.windowname, ret)
-                time.sleep(self.viz)
+                cv2.waitKey(int(self.viz * 1000))
         ret = ret.astype('float32')
         # 0.299,0.587.0.114. same as rgb2y in torch/image
-        ret = cv2.cvtColor(ret, cv2.COLOR_RGB2GRAY)
+        ret = cv2.cvtColor(ret, cv2.COLOR_RGB2GRAY)[:, :, np.newaxis]
         return ret.astype('uint8')  # to save some memory
 
     def _restart_episode(self):
@@ -140,12 +136,12 @@ class AtariPlayer(gym.Env):
                 self.last_raw_screen = self._grab_raw_image()
             self.ale.act(0)
 
-    def _reset(self):
+    def reset(self):
         if self.ale.game_over():
             self._restart_episode()
         return self._current_state()
 
-    def _step(self, act):
+    def step(self, act):
         oldlives = self.ale.lives()
         r = 0
         for k in range(self.frame_skip):
@@ -157,7 +153,7 @@ class AtariPlayer(gym.Env):
                     (self.live_lost_as_eoe and newlives < oldlives):
                 break
 
-        trueIsOver = isOver = self.ale.game_over()
+        isOver = self.ale.game_over()
         if self.live_lost_as_eoe:
             isOver = isOver or newlives < oldlives
 

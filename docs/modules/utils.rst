@@ -26,14 +26,6 @@ tensorpack.utils.fs module
     :undoc-members:
     :show-inheritance:
 
-tensorpack.utils.globvars module
---------------------------------
-
-.. automodule:: tensorpack.utils.globvars
-    :members:
-    :undoc-members:
-    :show-inheritance:
-
 tensorpack.utils.loadcaffe module
 ---------------------------------
 
@@ -58,6 +50,15 @@ tensorpack.utils.serialize module
     :members:
     :undoc-members:
     :show-inheritance:
+
+tensorpack.utils.compatible_serialize module
+--------------------------------------------
+
+.. automodule:: tensorpack.utils.compatible_serialize
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
 
 tensorpack.utils.stats module
 -----------------------------

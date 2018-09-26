@@ -1,9 +1,8 @@
-# -*- coding: UTF-8 -*-
+# -*- coding: utf-8 -*-
 # File: registry.py
-# Author: Yuxin Wu <ppwwyyxx@gmail.com>
+
 
 import tensorflow as tf
-import inspect
 from functools import wraps
 import six
 import re
@@ -66,7 +65,7 @@ def layer_register(
     Returns:
         A decorator used to register a layer.
 
-    Examples:
+    Example:
 
     .. code-block:: python
 
@@ -82,7 +81,8 @@ def layer_register(
             if use_scope:
                 name, inputs = args[0], args[1]
                 args = args[1:]  # actual positional args used to call func
-                assert isinstance(name, six.string_types), name
+                assert isinstance(name, six.string_types), "First argument for \"{}\" should be a string. ".format(
+                    func.__name__) + "Did you forget to specify the name of the layer?"
             else:
                 assert not log_shape
                 if isinstance(args[0], six.string_types):
@@ -105,12 +105,12 @@ def layer_register(
             actual_args = copy.copy(get_arg_scope()[func.__name__])
             # explicit kwargs overwrite argscope
             actual_args.update(kwargs)
-            if six.PY3:
-                # explicit positional args also override argscope. only work in PY3
-                posargmap = inspect.signature(func).bind_partial(*args).arguments
-                for k in six.iterkeys(posargmap):
-                    if k in actual_args:
-                        del actual_args[k]
+            # if six.PY3:
+            #     # explicit positional args also override argscope. only work in PY3
+            #     posargmap = inspect.signature(func).bind_partial(*args).arguments
+            #     for k in six.iterkeys(posargmap):
+            #         if k in actual_args:
+            #             del actual_args[k]
 
             if name is not None:        # use scope
                 with tf.variable_scope(name) as scope:

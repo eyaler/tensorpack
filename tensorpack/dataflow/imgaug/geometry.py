@@ -1,7 +1,6 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # File: geometry.py
-# Author: Yuxin Wu <ppwwyyxxc@gmail.com>
+
 
 import math
 import cv2

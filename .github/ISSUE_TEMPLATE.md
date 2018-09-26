@@ -1,24 +1,13 @@
-Bug Reports/Feature Requests/Usage Questions Only:
 
-Bug Reports (including performance bug):
-Some part of code (either the library or examples) doesn't work as expected.
-Always include the following:
-1. What you did. (command you run if using examples; post or describe your code if not)
-2. What you observed. (training logs)
-3. What you expected, if not obvious
-4. Your environment (TF version, GPUs), if it matters.
+## DO NOT post an issue if you're seeing this. You're at the wrong place.
 
-Feature Requests:
-1. Improve an existing feature.
-2. Add a new feature. Please note that, you can implement a lot of features by extending tensorpack
-	(See http://tensorpack.readthedocs.io/en/latest/tutorial/index.html#extend-tensorpack).
-	It may not have to be added to tensorpack unless you have a good reason.
-3. Note that we don't implement papers at others' requests.
+To post an issue, please:
 
-Usage Questions, e.g.:
-"How do I do [this specific thing] in tensorpack?"
-"Why certain examples need to be written in this way?"
-We don't answer general machine learning questions like:
-"I want to do [this machine learning task]. What specific things do I need to do?"
+1. Click the "New Issue" button
+2. __Choose your category__!
+3. __Read instructions there__!
 
-You can also use gitter (https://gitter.im/tensorpack/users) for more casual discussions.
+An issue has to be one of the following:
+- Unexpected Problems / Potential Bugs
+- Feature Requests
+- Questions on Using/Understanding Tensorpack

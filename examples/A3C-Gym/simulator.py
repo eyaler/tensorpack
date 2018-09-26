@@ -1,9 +1,8 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # File: simulator.py
-# Author: Yuxin Wu <ppwwyyxxc@gmail.com>
+# Author: Yuxin Wu
 
-import tensorflow as tf
 import multiprocessing as mp
 import time
 import os
@@ -15,12 +14,10 @@ import six
 from six.moves import queue
 import zmq
 
-from tensorpack.callbacks import Callback
-from tensorpack.tfutils.varmanip import SessionUpdate
-from tensorpack.predict import OfflinePredictor
 from tensorpack.utils import logger
 from tensorpack.utils.serialize import loads, dumps
-from tensorpack.utils.concurrency import LoopThread, ensure_proc_terminate
+from tensorpack.utils.concurrency import (
+    LoopThread, ensure_proc_terminate, enable_death_signal)
 
 __all__ = ['SimulatorProcess', 'SimulatorMaster',
            'SimulatorProcessStateExchange',
@@ -69,6 +66,7 @@ class SimulatorProcessStateExchange(SimulatorProcessBase):
         self.s2c = pipe_s2c
 
     def run(self):
+        enable_death_signal()
         player = self._build_player()
         context = zmq.Context()
         c2s_socket = context.socket(zmq.PUSH)
@@ -89,7 +87,7 @@ class SimulatorProcessStateExchange(SimulatorProcessBase):
             c2s_socket.send(dumps(
                 (self.identity, state, reward, isOver)),
                 copy=False)
-            action = loads(s2c_socket.recv(copy=False).bytes)
+            action = loads(s2c_socket.recv(copy=False))
             state, reward, isOver, _ = player.step(action)
             if isOver:
                 state = player.reset()
@@ -107,6 +105,7 @@ class SimulatorMaster(threading.Thread):
     class ClientState(object):
         def __init__(self):
             self.memory = []    # list of Experience
+            self.ident = None
 
     def __init__(self, pipe_c2s, pipe_s2c):
         super(SimulatorMaster, self).__init__()
@@ -145,37 +144,15 @@ class SimulatorMaster(threading.Thread):
         self.clients = defaultdict(self.ClientState)
         try:
             while True:
-                msg = loads(self.c2s_socket.recv(copy=False).bytes)
+                msg = loads(self.c2s_socket.recv(copy=False))
                 ident, state, reward, isOver = msg
-                # TODO check history and warn about dead client
                 client = self.clients[ident]
-
-                # check if reward&isOver is valid
-                # in the first message, only state is valid
-                if len(client.memory) > 0:
-                    client.memory[-1].reward = reward
-                    if isOver:
-                        self._on_episode_over(ident)
-                    else:
-                        self._on_datapoint(ident)
-                # feed state and return action
-                self._on_state(state, ident)
+                if client.ident is None:
+                    client.ident = ident
+                # maybe check history and warn about dead client?
+                self._process_msg(client, state, reward, isOver)
         except zmq.ContextTerminated:
             logger.info("[Simulator] Context was terminated.")
-
-    @abstractmethod
-    def _on_state(self, state, ident):
-        """response to state sent by ident. Preferrably an async call"""
-
-    @abstractmethod
-    def _on_episode_over(self, client):
-        """ callback when the client just finished an episode.
-            You may want to clear the client's memory in this callback.
-        """
-
-    def _on_datapoint(self, client):
-        """ callback when the client just finished a transition
-        """
 
     def __del__(self):
         self.context.destroy(linger=0)
@@ -199,7 +176,7 @@ if __name__ == '__main__':
             client.memory = []
             client.state = 0
 
-    name = 'ipc://whatever'
+    name = 'ipc://@whatever'
     procs = [NaiveSimulator(k, name) for k in range(10)]
     [k.start() for k in procs]
 

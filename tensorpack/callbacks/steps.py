@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # File: steps.py
 
@@ -15,7 +14,7 @@ from ..tfutils.common import (
     get_op_tensor_name, get_global_step_var)
 from .base import Callback
 
-__all__ = ['TensorPrinter', 'StepTensorPrinter', 'ProgressBar']
+__all__ = ['TensorPrinter', 'ProgressBar', 'SessionRunTimeout']
 
 
 class TensorPrinter(Callback):
@@ -29,7 +28,7 @@ class TensorPrinter(Callback):
             names(list): list of string, the names of the tensors to print.
         """
         names = [get_op_tensor_name(n)[1] for n in names]
-        logger.warn("Using print_stat or tf.Print in the graph is much faster than StepTensorPrinter!")
+        logger.warn("Using tf.Print in the graph is much faster than TensorPrinter!")
         self._names = names
 
     def _setup_graph(self):
@@ -43,9 +42,6 @@ class TensorPrinter(Callback):
         assert len(args) == len(self._names), len(args)
         for n, v in zip(self._names, args):
             logger.info("{}: {}".format(n, v))
-
-
-StepTensorPrinter = TensorPrinter
 
 
 class ProgressBar(Callback):
@@ -107,7 +103,7 @@ class ProgressBar(Callback):
 class MaintainStepCounter(Callback):
     """
     It maintains the global step in the graph, making sure it's increased by one.
-    This callback is used by the trainer, you don't need to worry about it.
+    This callback is used internally by the trainer, you don't need to worry about it.
     """
 
     _chief_only = False
@@ -136,3 +132,21 @@ class MaintainStepCounter(Callback):
     def _after_run(self, _, __):
         # Keep python-side global_step in agreement with TF-side
         self.trainer.loop._global_step += 1
+
+
+class SessionRunTimeout(Callback):
+    """
+    Add timeout option to each sess.run call.
+    """
+    def __init__(self, timeout_in_ms):
+        """
+        Args:
+            timeout_in_ms (int):
+"""
+        self._timeout = int(timeout_in_ms)
+
+        opt = tf.RunOptions(timeout_in_ms=timeout_in_ms)
+        self._runargs = tf.train.SessionRunArgs(fetches=[], options=opt)
+
+    def _before_run(self, _):
+        return self._runargs

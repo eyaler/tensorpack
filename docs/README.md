@@ -2,8 +2,9 @@
 ## Build the docs:
 
 ### Dependencies:
-1. python3
-2. `pip install -r requirements.txt`
+1. Python 3
+2. Remove "tensorflow" from `requirements.txt` since you probably prefer to install TensorFlow by yourself.
+3. `pip install -r requirements.txt`. Note that these requirements are different from tensorpack dependencies.
 
 ### Build HTML docs:
 `make html`
@@ -11,4 +12,5 @@ will build the docs in `build/html`.
 
 ### Build Dash/Zeal docset
 
-`make docset` produces `tensorpack.docset`.
+1. `pip install doc2dash`
+2. `make docset` produces `tensorpack.docset`.

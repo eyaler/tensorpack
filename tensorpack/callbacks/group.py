@@ -1,15 +1,20 @@
-# -*- coding: UTF-8 -*-
+# -*- coding: utf-8 -*-
 # File: group.py
-# Author: Yuxin Wu <ppwwyyxx@gmail.com>
+
 
 import tensorflow as tf
 from contextlib import contextmanager
-import time
+from time import time as timer
 import traceback
+import six
 
 from .base import Callback
 from .hooks import CallbackToHook
 from ..utils import logger
+from ..utils.utils import humanize_time_delta
+
+if six.PY3:
+    from time import perf_counter as timer  # noqa
 
 __all__ = ['Callbacks']
 
@@ -25,18 +30,19 @@ class CallbackTimeLogger(object):
 
     @contextmanager
     def timed_callback(self, name):
-        s = time.time()
+        s = timer()
         yield
-        self.add(name, time.time() - s)
+        self.add(name, timer() - s)
 
     def log(self):
+
         """ log the time of some heavy callbacks """
         if self.tot < 3:
             return
         msgs = []
         for name, t in self.times:
             if t / self.tot > 0.3 and t > 1:
-                msgs.append("{}: {:.3f}sec".format(name, t))
+                msgs.append(name + ": " + humanize_time_delta(t))
         logger.info(
             "Callbacks took {:.3f} sec in total. {}".format(
                 self.tot, '; '.join(msgs)))

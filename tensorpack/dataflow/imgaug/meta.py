@@ -1,7 +1,5 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # File: meta.py
-# Author: Yuxin Wu <ppwwyyxxc@gmail.com>
 
 
 from .base import ImageAugmentor

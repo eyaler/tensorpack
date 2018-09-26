@@ -1,6 +1,6 @@
-# -*- coding: UTF-8 -*-
+# -*- coding: utf-8 -*-
 # File: imgproc.py
-# Author: Yuxin Wu <ppwwyyxx@gmail.com>
+
 
 from .base import ImageAugmentor
 from ...utils import logger
@@ -18,7 +18,7 @@ class Hue(ImageAugmentor):
     def __init__(self, range=(0, 180), rgb=None):
         """
         Args:
-            range(list or tuple): hue range
+            range(list or tuple): range from which the applied hue offset is selected (maximum [-90,90] or [0,180])
             rgb (bool): whether input is RGB or BGR.
         """
         super(Hue, self).__init__()
@@ -34,9 +34,13 @@ class Hue(ImageAugmentor):
     def _augment(self, img, hue):
         m = cv2.COLOR_BGR2HSV if not self.rgb else cv2.COLOR_RGB2HSV
         hsv = cv2.cvtColor(img, m)
-        # Note, OpenCV used 0-179 degree instead of 0-359 degree
-        hsv[..., 0] = (hsv[..., 0] + hue) % 180
-
+        # https://docs.opencv.org/3.2.0/de/d25/imgproc_color_conversions.html#color_convert_rgb_hsv
+        if hsv.dtype.itemsize == 1:
+            # OpenCV uses 0-179 for 8-bit images
+            hsv[..., 0] = (hsv[..., 0] + hue) % 180
+        else:
+            # OpenCV uses 0-360 for floating point images
+            hsv[..., 0] = (hsv[..., 0] + 2 * hue) % 360
         m = cv2.COLOR_HSV2BGR if not self.rgb else cv2.COLOR_HSV2RGB
         img = cv2.cvtColor(hsv, m)
         return img
@@ -217,16 +221,13 @@ class Saturation(ImageAugmentor):
         <https://github.com/facebook/fb.resnet.torch/blob/master/datasets/transforms.lua#L218>`__.
     """
 
-    def __init__(self, alpha=0.4, rgb=None):
+    def __init__(self, alpha=0.4, rgb=True):
         """
         Args:
             alpha(float): maximum saturation change.
             rgb (bool): whether input is RGB or BGR.
         """
         super(Saturation, self).__init__()
-        if rgb is None:
-            logger.warn("Saturation() now assumes rgb=False, but will by default use rgb=True in the future!")
-            rgb = False
         rgb = bool(rgb)
         assert alpha < 1
         self._init(locals())
@@ -239,6 +240,8 @@ class Saturation(ImageAugmentor):
         m = cv2.COLOR_RGB2GRAY if self.rgb else cv2.COLOR_BGR2GRAY
         grey = cv2.cvtColor(img, m)
         ret = img * v + (grey * (1 - v))[:, :, np.newaxis]
+        if old_dtype == np.uint8:
+            ret = np.clip(ret, 0, 255)
         return ret.astype(old_dtype)
 
 
@@ -265,7 +268,8 @@ class Lighting(ImageAugmentor):
 
     def _get_augment_params(self, img):
         assert img.shape[2] == 3
-        return self.rng.randn(3) * self.std
+        ret = self.rng.randn(3) * self.std
+        return ret.astype('float32')
 
     def _augment(self, img, v):
         old_dtype = img.dtype

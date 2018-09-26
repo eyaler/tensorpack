@@ -1,11 +1,10 @@
-# -*- coding: UTF-8 -*-
+# -*- coding: utf-8 -*-
 # File: base.py
-# Author: Yuxin Wu <ppwwyyxx@gmail.com>
+
 
 import tensorflow as tf
 from abc import ABCMeta
 import six
-from ..utils.develop import log_deprecated
 from ..tfutils.common import get_op_or_tensor_by_name
 
 __all__ = ['Callback', 'ProxyCallback', 'CallbackFactory']
@@ -202,9 +201,17 @@ class Callback(object):
     def chief_only(self, v):
         self._chief_only = v
 
+    def set_chief_only(self, v=True):
+        """
+        Set chief_only property, and returns the callback itself.
+        """
+        self._chief_only = v
+        return self
+
     def __str__(self):
         return type(self).__name__
 
+    # TODO RENAME: same function to be used to get ops as well
     def get_tensors_maybe_in_tower(self, names):
         """
         Get tensors in the graph with the given names.
@@ -222,8 +229,9 @@ class Callback(object):
                 return get_op_or_tensor_by_name(name)
             except KeyError:
                 pass
-            assert isinstance(self.trainer, TowerTrainer), msg
-            towers = self.trainer.tower_func.towers
+            if not isinstance(self.trainer, TowerTrainer):
+                raise KeyError(msg)
+            towers = self.trainer.towers
             try:
                 return towers.training()[0][name]
             except KeyError:
@@ -242,6 +250,7 @@ class ProxyCallback(Callback):
             cb(Callback): the underlying callback
         """
         assert isinstance(cb, Callback), type(cb)
+        self.chief_only = cb.chief_only
         self.cb = cb
 
     def _before_train(self):
@@ -284,22 +293,15 @@ class CallbackFactory(Callback):
     Create a callback with some lambdas.
     """
     def __init__(self, setup_graph=None, before_train=None, trigger=None,
-                 after_train=None, trigger_epoch=None):
+                 after_train=None):
         """
         Each lambda takes ``self`` as the only argument.
-
-        Note:
-            trigger_epoch was deprecated.
         """
 
         self._cb_setup_graph = setup_graph
         self._cb_before_train = before_train
         self._cb_trigger = trigger
         self._cb_after_train = after_train
-
-        if trigger_epoch:
-            self._cb_trigger = trigger_epoch
-            log_deprecated("CallbackFactory(trigger_epoch=)", "Use trigger instead.", "2017-11-15")
 
     def _setup_graph(self):
         if self._cb_setup_graph:

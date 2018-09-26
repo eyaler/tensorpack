@@ -1,7 +1,6 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # File: concurrency.py
-# Author: Yuxin Wu <ppwwyyxxc@gmail.com>
+
 
 import numpy as np
 import multiprocessing
@@ -131,14 +130,14 @@ class PredictorWorkerThread(StoppableThread, ShareSessionThread):
 
 class MultiThreadAsyncPredictor(AsyncPredictorBase):
     """
-    An multithread online async predictor which runs a list of OnlinePredictor.
+    An multithreaded online async predictor which runs a list of OnlinePredictor.
     It would do an extra batching internally.
     """
 
     def __init__(self, predictors, batch_size=5):
         """
         Args:
-            predictors (list): a list of OnlinePredictor avaiable to use.
+            predictors (list): a list of OnlinePredictor available to use.
             batch_size (int): the maximum of an internal batch.
         """
         assert len(predictors)

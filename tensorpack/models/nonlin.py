@@ -1,14 +1,13 @@
-#!/usr/bin/env python
-# -*- coding: UTF-8 -*-
+# -*- coding: utf-8 -*-
 # File: nonlin.py
-# Author: Yuxin Wu <ppwwyyxx@gmail.com>
+
 
 import tensorflow as tf
 
 from .common import layer_register, VariableHolder
 from .batch_norm import BatchNorm
 
-__all__ = ['Maxout', 'PReLU', 'LeakyReLU', 'BNReLU']
+__all__ = ['Maxout', 'PReLU', 'BNReLU']
 
 
 @layer_register(use_scope=None)
@@ -58,20 +57,6 @@ def PReLU(x, init=0.001, name='output'):
 
     ret.variables = VariableHolder(alpha=alpha)
     return ret
-
-
-@layer_register(use_scope=None)
-def LeakyReLU(x, alpha, name='output'):
-    """
-    Leaky ReLU as in paper `Rectifier Nonlinearities Improve Neural Network Acoustic
-    Models
-    <http://ai.stanford.edu/~amaas/papers/relu_hybrid_icml2013_final.pdf>`_.
-
-    Args:
-        x (tf.Tensor): input
-        alpha (float): the slope.
-    """
-    return tf.maximum(x, alpha * x, name=name)
 
 
 @layer_register(use_scope=None)

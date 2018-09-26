@@ -1,18 +1,16 @@
-# -*- coding: UTF-8 -*-
+# -*- coding: utf-8 -*-
 # File: summary.py
-# Author: Yuxin Wu <ppwwyyxx@gmail.com>
+
 
 import six
 import tensorflow as tf
 import re
-import io
 from six.moves import range
 from contextlib import contextmanager
 
 from tensorflow.python.training import moving_averages
 
 from ..utils import logger
-from ..utils.develop import log_deprecated
 from ..utils.argtools import graph_memoized
 from ..utils.naming import MOVING_SUMMARY_OPS_KEY
 from .tower import get_current_tower_context
@@ -20,7 +18,8 @@ from .symbolic_functions import rms
 from .scope_utils import cached_name_scope
 
 __all__ = ['add_tensor_summary', 'add_param_summary',
-           'add_activation_summary', 'add_moving_summary']
+           'add_activation_summary', 'add_moving_summary',
+           ]
 
 
 # some scope stuff to use internally...
@@ -71,20 +70,25 @@ def create_image_summary(name, val):
     s = tf.Summary()
     for k in range(n):
         arr = val[k]
-        if arr.shape[2] == 1:   # scipy doesn't accept (h,w,1)
-            arr = arr[:, :, 0]
+        # CV2 will only write correctly in BGR chanel order
+        if c == 3:
+            arr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+        elif c == 4:
+            arr = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGRA)
         tag = name if n == 1 else '{}/{}'.format(name, k)
 
-        buf = io.BytesIO()
-        # scipy assumes RGB
-        scipy.misc.toimage(arr).save(buf, format='png')
+        retval, img_str = cv2.imencode('.png', arr)
+        if not retval:
+            # Encoding has failed.
+            continue
+        img_str = img_str.tostring()
 
         img = tf.Summary.Image()
         img.height = h
         img.width = w
         # 1 - grayscale 3 - RGB 4 - RGBA
         img.colorspace = c
-        img.encoded_image_string = buf.getvalue()
+        img.encoded_image_string = img_str
         s.value.add(tag=tag, image=img)
     return s
 
@@ -103,7 +107,7 @@ def add_tensor_summary(x, types, name=None, collections=None,
             set to True, calling this function under other TowerContext
             has no effect.
 
-    Examples:
+    Example:
 
     .. code-block:: python
 
@@ -166,7 +170,7 @@ def add_param_summary(*summary_lists, **kwargs):
             Summary type is defined in :func:`add_tensor_summary`.
         collections (list[str]): collections of the summary ops.
 
-    Examples:
+    Example:
 
     .. code-block:: python
 
@@ -194,15 +198,17 @@ def add_param_summary(*summary_lists, **kwargs):
 
 def add_moving_summary(*args, **kwargs):
     """
-    Add moving average summary for some tensors.
+    Summarize the moving average for scalar tensors.
     This function is a no-op if not calling from main training tower.
 
     Args:
-        args: tensors to summarize
+        args: scalar tensors to summarize
         decay (float): the decay rate. Defaults to 0.95.
         collection (str or None): the name of the collection to add EMA-maintaining ops.
             The default will work together with the default
             :class:`MovingAverageSummary` callback.
+        summary_collections ([str]): the names of collections to add the
+            summary op. Default is TF's default (`tf.GraphKeys.SUMMARIES`).
 
     Returns:
         [tf.Tensor]: list of tensors returned by assign_moving_average,
@@ -210,28 +216,31 @@ def add_moving_summary(*args, **kwargs):
     """
     decay = kwargs.pop('decay', 0.95)
     coll = kwargs.pop('collection', MOVING_SUMMARY_OPS_KEY)
+    summ_coll = kwargs.pop('summary_collections', None)
     assert len(kwargs) == 0, "Unknown arguments: " + str(kwargs)
 
     ctx = get_current_tower_context()
     # allow ctx to be none
     if ctx is not None and not ctx.is_main_training_tower:
-        return
+        return []
+    if tf.get_variable_scope().reuse is True:
+        logger.warn("add_moving_summary() called under reuse=True scope, ignored.")
+        return []
 
-    if not isinstance(args[0], list):
-        v = args
-    else:
-        log_deprecated("Call add_moving_summary with positional args instead of a list!")
-        v = args[0]
-    for x in v:
-        assert isinstance(x, tf.Tensor), x
-        assert x.get_shape().ndims == 0, x.get_shape()
-    G = tf.get_default_graph()
+    if len(args) == 1 and isinstance(args[0], (list, tuple)):
+        logger.warn("add_moving_summary() takes positional args instead of an iterable of tensors!")
+        args = args[0]
+
+    for x in args:
+        assert isinstance(x, (tf.Tensor, tf.Variable)), x
+        assert x.get_shape().ndims == 0, \
+            "add_moving_summary() only accepts scalar tensor! Got one with {}".format(x.get_shape())
     # TODO variable not saved under distributed
 
     ema_ops = []
-    for c in v:
+    for c in args:
         name = re.sub('tower[0-9]+/', '', c.op.name)
-        with G.colocate_with(c), tf.name_scope(None):
+        with tf.name_scope(None):
             if not c.dtype.is_floating:
                 c = tf.cast(c, tf.float32)
             # assign_moving_average creates variables with op names, therefore clear ns first.
@@ -245,17 +254,17 @@ def add_moving_summary(*args, **kwargs):
                     zero_debias=True, name=name + '_EMA_apply')
             ema_ops.append(ema_op)
         with tf.name_scope(None):
-            # cannot add it into colocate group -- will force everything to cpus
-            tf.summary.scalar(name + '-summary', ema_op)    # write the EMA value as a summary
+            tf.summary.scalar(
+                name + '-summary', ema_op,
+                collections=summ_coll)    # write the EMA value as a summary
     if coll is not None:
         for op in ema_ops:
-            # TODO a new collection to summary every step?
             tf.add_to_collection(coll, op)
     return ema_ops
 
 
 try:
-    import scipy.misc
+    import cv2
 except ImportError:
     from ..utils.develop import create_dummy_func
-    create_image_summary = create_dummy_func('create_image_summary', 'scipy.misc')  # noqa
+    create_image_summary = create_dummy_func('create_image_summary', 'cv2')  # noqa

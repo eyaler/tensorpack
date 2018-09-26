@@ -1,14 +1,16 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # File: argscope.py
-# Author: Yuxin Wu <ppwwyyxxc@gmail.com>
+
 from contextlib import contextmanager
 from collections import defaultdict
-import inspect
 import copy
-import six
+from functools import wraps
+from inspect import isfunction, getmembers
 
-__all__ = ['argscope', 'get_arg_scope']
+from .tower import get_current_tower_context
+from ..utils import logger
+
+__all__ = ['argscope', 'get_arg_scope', 'enable_argscope_for_module']
 
 _ArgScopeStack = []
 
@@ -35,14 +37,14 @@ def argscope(layers, **kwargs):
     if not isinstance(layers, list):
         layers = [layers]
 
-    def _check_args_exist(l):
-        args = inspect.getargspec(l).args
-        for k, v in six.iteritems(kwargs):
-            assert k in args, "No argument {} in {}".format(k, l.__name__)
+    # def _check_args_exist(l):
+    #     args = inspect.getargspec(l).args
+    #     for k, v in six.iteritems(kwargs):
+    #         assert k in args, "No argument {} in {}".format(k, l.__name__)
 
     for l in layers:
         assert hasattr(l, 'symbolic_function'), "{} is not a registered layer".format(l.__name__)
-        _check_args_exist(l.symbolic_function)
+        # _check_args_exist(l.symbolic_function)
 
     new_scope = copy.copy(get_arg_scope())
     for l in layers:
@@ -63,3 +65,40 @@ def get_arg_scope():
         return _ArgScopeStack[-1]
     else:
         return defaultdict(dict)
+
+
+def argscope_mapper(func, log_shape=True):
+    """Decorator for function to support argscope
+    """
+    @wraps(func)
+    def wrapped_func(*args, **kwargs):
+        actual_args = copy.copy(get_arg_scope()[func.__name__])
+        actual_args.update(kwargs)
+        out_tensor = func(*args, **actual_args)
+        in_tensor = args[0]
+
+        ctx = get_current_tower_context()
+        name = '<unkown>' if 'name' not in kwargs else kwargs['name']
+        if log_shape:
+            if ('tower' not in ctx.ns_name.lower()) or ctx.is_main_training_tower:
+                logger.info('%20s: %20s -> %20s' %
+                            (name, in_tensor.shape.as_list(), out_tensor.shape.as_list()))
+
+        return out_tensor
+    # argscope requires this property
+    wrapped_func.symbolic_function = None
+    return wrapped_func
+
+
+def enable_argscope_for_module(module, log_shape=True):
+    """
+    Overwrite all functions of a given module to support argscope.
+    Note that this function monkey-patches the module and therefore could have unexpected consequences.
+    It has been only tested to work well with `tf.layers` module.
+
+    Args:
+        log_shape (bool): print input/output shapes of each function when called.
+    """
+    for name, obj in getmembers(module):
+        if isfunction(obj):
+            setattr(module, name, argscope_mapper(obj, log_shape=log_shape))

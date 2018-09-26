@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # File: varreplace.py
 # Credit: Qinyao He
@@ -6,31 +5,32 @@
 import tensorflow as tf
 from contextlib import contextmanager
 
-from ..utils.develop import deprecated
+from .common import get_tf_version_tuple
 
-__all__ = ['replace_get_variable',
-           'freeze_variables', 'freeze_get_variable', 'remap_get_variable',
-           'remap_variables']
+__all__ = ['custom_getter_scope', 'freeze_variables', 'remap_variables']
 
 
 @contextmanager
 def custom_getter_scope(custom_getter):
-    scope = tf.get_variable_scope()
-    with tf.variable_scope(scope, custom_getter=custom_getter):
-        yield
-
-
-@deprecated("Use custom_getter_scope instead.", "2017-11-06")
-def replace_get_variable(fn):
     """
     Args:
-        fn: a function compatible with ``tf.get_variable``.
+        custom_getter: the same as in :func:`tf.get_variable`
+
     Returns:
-        a context with a custom getter
+        The current variable scope with a custom_getter.
     """
-    def getter(_, *args, **kwargs):
-        return fn(*args, **kwargs)
-    return custom_getter_scope(getter)
+    scope = tf.get_variable_scope()
+    if get_tf_version_tuple() >= (1, 5):
+        with tf.variable_scope(
+                scope, custom_getter=custom_getter,
+                auxiliary_name_scope=False):
+            yield
+    else:
+        ns = tf.get_default_graph().get_name_scope()
+        with tf.variable_scope(
+                scope, custom_getter=custom_getter):
+            with tf.name_scope(ns + '/' if ns else ''):
+                yield
 
 
 def remap_variables(fn):
@@ -41,7 +41,8 @@ def remap_variables(fn):
         fn (tf.Variable -> tf.Tensor)
 
     Returns:
-        a context where all the variables will be mapped by fn.
+        The current variable scope with a custom_getter that maps
+        all the variables by fn.
 
     Example:
         .. code-block:: python
@@ -55,32 +56,42 @@ def remap_variables(fn):
     return custom_getter_scope(custom_getter)
 
 
-def freeze_variables():
+def freeze_variables(stop_gradient=True, skip_collection=False):
     """
-    Return a context, where all trainable variables (reused or not) returned by
-    ``get_variable`` will have no gradients (they will be wrapped by ``tf.stop_gradient``).
-    But they will still be in ``TRAINABLE_VARIABLES`` collections so they will get
-    saved correctly. This is useful to fix certain variables for fine-tuning.
+    Return a context to freeze variables,
+    by wrapping ``tf.get_variable`` with a custom getter.
+    It works by either applying ``tf.stop_gradient`` on the variables,
+    or by keeping them out of the ``TRAINABLE_VARIABLES`` collection, or
+    both.
 
     Example:
         .. code-block:: python
 
-            with varreplace.freeze_variable():
+            with varreplace.freeze_variable(stop_gradient=False, skip_collection=True):
                 x = FullyConnected('fc', x, 1000)   # fc/* will not be trained
+
+    Args:
+        stop_gradient (bool): if True, variables returned from `get_variable`
+            will be wrapped with `tf.stop_gradient` and therefore has no
+            gradient when used later.
+            Note that the created variables may still have gradient when accessed
+            by other approaches (e.g. by name, or by collection).
+            Also note that this makes `tf.get_variable` returns a Tensor instead of a Variable,
+            which may break existing code.
+            Therefore, it's recommended to use the `skip_collection` option instead.
+        skip_collection (bool): if True, do not add the variable to
+            ``TRAINABLE_VARIABLES`` collection, but to ``MODEL_VARIABLES``
+            collection. As a result they will not be trained by default.
     """
     def custom_getter(getter, *args, **kwargs):
+        trainable = kwargs.get('trainable', True)
+        name = args[0] if len(args) else kwargs.get('name')
+        if skip_collection:
+            kwargs['trainable'] = False
         v = getter(*args, **kwargs)
-        if kwargs.pop('trainable', True):
-            v = tf.stop_gradient(v)
+        if skip_collection:
+            tf.add_to_collection(tf.GraphKeys.MODEL_VARIABLES, v)
+        if trainable and stop_gradient:
+            v = tf.stop_gradient(v, name='freezed_' + name)
         return v
     return custom_getter_scope(custom_getter)
-
-
-@deprecated("Renamed to remap_variables", "2017-11-06")
-def remap_get_variable():
-    return remap_variables()
-
-
-@deprecated("Renamed to freeze_variables", "2017-11-06")
-def freeze_get_variable():
-    return freeze_variables()

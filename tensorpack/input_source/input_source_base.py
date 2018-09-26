@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # File: input_source_base.py
 
@@ -76,8 +75,8 @@ class InputSource(object):
         """
         Returns:
             list: A list of tensors corresponding to the inputs of the model,
-                used as input of :func:`build_graph`.
-                For non-placeholder tensors, should always create and return new tensors when called.
+            used as input of :func:`build_graph`.
+            For non-placeholder tensors, should always create and return new tensors when called.
         """
         return self._get_input_tensors()
 
@@ -93,6 +92,7 @@ class InputSource(object):
 
         Returns:
             list[Callback]: extra callbacks needed by this InputSource.
+            callbacks of InputSource cannot use any `trigger*()` method.
         """
         self._setup(inputs_desc)
         self._setup_done = True
@@ -111,16 +111,23 @@ class InputSource(object):
     @memoized
     def get_callbacks(self):
         """
-        An InputSource might need some extra maintainance during training,
+        An InputSource might need some extra maintenance during training,
         which is done also through the Callback interface.
         This method returns the callbacks and the return value will be memoized.
+
+        All callbacks will be automatically marked as `chief_only=False`,
+        so they will run on all nodes.
 
         Returns:
             list[Callback]: extra callbacks needed by this InputSource.
         """
         assert self.setup_done()
-        return [CallbackFactory(
+        ret = [CallbackFactory(
             before_train=lambda _: self.reset_state())] + self._get_callbacks()
+
+        for r in ret:
+            r.set_chief_only(False)    # no input callbacks should be chief-only
+        return ret
 
     def _get_callbacks(self):
         return []
@@ -130,7 +137,7 @@ class InputSource(object):
         Initialize/reinitialize this InputSource.
         Must be called under a default session.
 
-        For training, it will get called by the trainer in `before_train` callbacks.
+        For training, it will get called once by the trainer in `before_train` callbacks.
         For inference, the :class:`InferenceRunner` will call this method each time it is triggered.
         """
         self._reset_state()
@@ -204,7 +211,7 @@ def remap_input_source(input, names):
     Returns:
         InputSource:
 
-    Examples:
+    Example:
 
     .. code-block:: python
 

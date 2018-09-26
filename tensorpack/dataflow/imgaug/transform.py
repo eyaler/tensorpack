@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # File: transform.py
 
@@ -43,7 +42,7 @@ class ImageTransform(object):
     def _init(self, params=None):
         if params:
             for k, v in params.items():
-                if k != 'self':
+                if k != 'self' and not k.startswith('_'):
                     setattr(self, k, v)
 
     @abstractmethod
@@ -57,6 +56,7 @@ class ImageTransform(object):
 
 class ResizeTransform(ImageTransform):
     def __init__(self, h, w, newh, neww, interp):
+        super(ResizeTransform, self).__init__()
         self._init(locals())
 
     def apply_image(self, img):
@@ -76,6 +76,7 @@ class ResizeTransform(ImageTransform):
 
 class CropTransform(ImageTransform):
     def __init__(self, h0, w0, h, w):
+        super(CropTransform, self).__init__()
         self._init(locals())
 
     def apply_image(self, img):
@@ -90,6 +91,7 @@ class CropTransform(ImageTransform):
 class WarpAffineTransform(ImageTransform):
     def __init__(self, mat, dsize, interp=cv2.INTER_LINEAR,
                  borderMode=cv2.BORDER_CONSTANT, borderValue=0):
+        super(WarpAffineTransform, self).__init__()
         self._init(locals())
 
     def apply_image(self, img):
@@ -134,7 +136,7 @@ if __name__ == '__main__':
     print(coords)
     draw_points(image, coords)
 
-    #viz = cv2.resize(viz, (1200, 600))
+    # viz = cv2.resize(viz, (1200, 600))
     orig_image = cv2.resize(orig_image, (600, 600))
     image = cv2.resize(image, (600, 600))
     viz = np.concatenate((orig_image, image), axis=1)

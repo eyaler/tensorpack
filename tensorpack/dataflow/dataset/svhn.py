@@ -1,7 +1,6 @@
-#!/usr/bin/env python
-# -*- coding: UTF-8 -*-
+# -*- coding: utf-8 -*-
 # File: svhn.py
-# Author: Yuxin Wu <ppwwyyxx@gmail.com>
+
 
 import os
 import numpy as np
@@ -50,10 +49,10 @@ class SVHNDigit(RNGDataFlow):
         self.Y[self.Y == 10] = 0
         SVHNDigit._Cache[name] = (self.X, self.Y)
 
-    def size(self):
+    def __len__(self):
         return self.X.shape[0]
 
-    def get_data(self):
+    def __iter__(self):
         n = self.X.shape[0]
         idxs = np.arange(n)
         if self.shuffle:
@@ -65,7 +64,8 @@ class SVHNDigit(RNGDataFlow):
     @staticmethod
     def get_per_pixel_mean():
         """
-        return 32x32x3 image
+        Returns:
+            a 32x32x3 image
         """
         a = SVHNDigit('train')
         b = SVHNDigit('test')

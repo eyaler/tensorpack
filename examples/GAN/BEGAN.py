@@ -1,16 +1,11 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # File: BEGAN.py
-# Author: Yuxin Wu <ppwwyyxxc@gmail.com>
+# Author: Yuxin Wu
 
-import os
-import argparse
-
-os.environ['TENSORPACK_TRAIN_API'] = 'v2'   # will become default soon
 from tensorpack import *
 from tensorpack.tfutils.summary import add_moving_summary
-from tensorpack.utils.gpu import get_nr_gpu
-from tensorpack.utils.globvars import globalns as G
+from tensorpack.utils.gpu import get_num_gpu
 from tensorpack.tfutils.scope_utils import auto_reuse_variable_scope
 import tensorflow as tf
 
@@ -20,29 +15,26 @@ from GAN import GANModelDesc, GANTrainer, MultiGPUGANTrainer
 Boundary Equilibrium GAN.
 See the docstring in DCGAN.py for usage.
 
-A pretrained model on CelebA is at
-https://drive.google.com/open?id=0B5uDfUQ1JTglUmgyZV8zQmNOTVU
+A pretrained model on CelebA is at http://models.tensorpack.com/GAN/
 """
 
 
 import DCGAN
-G.BATCH = 32
-G.Z_DIM = 64
 NH = 64
 NF = 64
 GAMMA = 0.5
 
 
 class Model(GANModelDesc):
-    def _get_inputs(self):
-        return [InputDesc(tf.float32, (None, G.SHAPE, G.SHAPE, 3), 'input')]
+    def inputs(self):
+        return [tf.placeholder(tf.float32, (None, args.final_size, args.final_size, 3), 'input')]
 
     @auto_reuse_variable_scope
     def decoder(self, z):
-        l = FullyConnected('fc', z, NF * 8 * 8, nl=tf.identity)
+        l = FullyConnected('fc', z, NF * 8 * 8)
         l = tf.reshape(l, [-1, 8, 8, NF])
 
-        with argscope(Conv2D, nl=tf.nn.elu, kernel_shape=3, stride=1):
+        with argscope(Conv2D, activation=tf.nn.elu, kernel_size=3, strides=1):
             l = (LinearWrap(l)
                  .Conv2D('conv1.1', NF)
                  .Conv2D('conv1.2', NF)
@@ -55,12 +47,12 @@ class Model(GANModelDesc):
                  .tf.image.resize_nearest_neighbor([64, 64], align_corners=True)
                  .Conv2D('conv4.1', NF)
                  .Conv2D('conv4.2', NF)
-                 .Conv2D('conv4.3', 3, nl=tf.identity)())
+                 .Conv2D('conv4.3', 3, activation=tf.identity)())
         return l
 
     @auto_reuse_variable_scope
     def encoder(self, imgs):
-        with argscope(Conv2D, nl=tf.nn.elu, kernel_shape=3, stride=1):
+        with argscope(Conv2D, activation=tf.nn.elu, kernel_size=3, strides=1):
             l = (LinearWrap(imgs)
                  .Conv2D('conv1.1', NF)
                  .Conv2D('conv1.2', NF)
@@ -78,15 +70,14 @@ class Model(GANModelDesc):
                  .Conv2D('conv4.1', NF * 4)
                  .Conv2D('conv4.2', NF * 4)
 
-                 .FullyConnected('fc', NH, nl=tf.identity)())
+                 .FullyConnected('fc', NH)())
         return l
 
-    def _build_graph(self, inputs):
-        image_pos = inputs[0]
+    def build_graph(self, image_pos):
         image_pos = image_pos / 128.0 - 1
 
-        z = tf.random_uniform([G.BATCH, G.Z_DIM], minval=-1, maxval=1, name='z_train')
-        z = tf.placeholder_with_default(z, [None, G.Z_DIM], name='z')
+        z = tf.random_uniform([args.batch, args.z_dim], minval=-1, maxval=1, name='z_train')
+        z = tf.placeholder_with_default(z, [None, args.z_dim], name='z')
 
         def summary_image(name, x):
             x = (x + 1.0) * 128.0
@@ -94,7 +85,7 @@ class Model(GANModelDesc):
             tf.summary.image(name, tf.cast(x, tf.uint8), max_outputs=30)
 
         with argscope([Conv2D, FullyConnected],
-                      W_init=tf.truncated_normal_initializer(stddev=0.02)):
+                      kernel_initializer=tf.truncated_normal_initializer(stddev=0.02)):
             with tf.variable_scope('gen'):
                 image_gen = self.decoder(z)
 
@@ -131,23 +122,22 @@ class Model(GANModelDesc):
 
         self.collect_variables()
 
-    def _get_optimizer(self):
+    def optimizer(self):
         lr = tf.get_variable('learning_rate', initializer=1e-4, trainable=False)
         opt = tf.train.AdamOptimizer(lr, beta1=0.5, beta2=0.9)
         return opt
 
 
 if __name__ == '__main__':
-    args = DCGAN.get_args()
+    args = DCGAN.get_args(default_batch=32, default_z_dim=64)
     if args.sample:
         DCGAN.sample(Model(), args.load, 'gen/conv4.3/output')
     else:
-        assert args.data
         logger.auto_set_dir()
 
-        input = QueueInput(DCGAN.get_data(args.data))
+        input = QueueInput(DCGAN.get_data())
         model = Model()
-        nr_tower = max(get_nr_gpu(), 1)
+        nr_tower = max(get_num_gpu(), 1)
         if nr_tower == 1:
             trainer = GANTrainer(input, model)
         else:

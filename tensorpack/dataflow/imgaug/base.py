@@ -1,13 +1,16 @@
-# -*- coding: UTF-8 -*-
+# -*- coding: utf-8 -*-
 # File: base.py
-# Author: Yuxin Wu <ppwwyyxx@gmail.com>
+
 
 import inspect
 import pprint
 from abc import abstractmethod, ABCMeta
-from ...utils.utils import get_rng
 import six
 from six.moves import zip
+
+from ...utils.utils import get_rng
+from ...utils.argtools import log_once
+from ..image import check_dtype
 
 __all__ = ['Augmentor', 'ImageAugmentor', 'AugmentorList']
 
@@ -22,7 +25,7 @@ class Augmentor(object):
     def _init(self, params=None):
         if params:
             for k, v in params.items():
-                if k != 'self':
+                if k != 'self' and not k.startswith('_'):
                     setattr(self, k, v)
 
     def reset_state(self):
@@ -38,9 +41,9 @@ class Augmentor(object):
 
     def augment_return_params(self, d):
         """
-
+        Returns:
             augmented data
-            augmentaion params
+            augmentation params
         """
         return self._augment_return_params(d)
 
@@ -79,43 +82,51 @@ class Augmentor(object):
         Produce something like:
         "imgaug.MyAugmentor(field1={self.field1}, field2={self.field2})"
         """
-        argspec = inspect.getargspec(self.__init__)
-        assert argspec.varargs is None, "The default __repr__ doesn't work for vaargs!"
-        assert argspec.keywords is None, "The default __repr__ doesn't work for kwargs!"
-        fields = argspec.args[1:]
-        index_field_has_default = len(fields) - (0 if argspec.defaults is None else len(argspec.defaults))
+        try:
+            argspec = inspect.getargspec(self.__init__)
+            assert argspec.varargs is None, "The default __repr__ doesn't work for varargs!"
+            assert argspec.keywords is None, "The default __repr__ doesn't work for kwargs!"
+            fields = argspec.args[1:]
+            index_field_has_default = len(fields) - (0 if argspec.defaults is None else len(argspec.defaults))
 
-        classname = type(self).__name__
-        argstr = []
-        for idx, f in enumerate(fields):
-            assert hasattr(self, f), \
-                "Attribute {} not found! The default __repr__ only works if attributes match the constructor.".format(f)
-            attr = getattr(self, f)
-            if idx >= index_field_has_default:
-                if attr is argspec.defaults[idx - index_field_has_default]:
-                    continue
-            argstr.append("{}={}".format(f, pprint.pformat(attr)))
-        return "imgaug.{}({})".format(classname, ', '.join(argstr))
+            classname = type(self).__name__
+            argstr = []
+            for idx, f in enumerate(fields):
+                assert hasattr(self, f), \
+                    "Attribute {} not found! Default __repr__ only works if attributes match the constructor.".format(f)
+                attr = getattr(self, f)
+                if idx >= index_field_has_default:
+                    if attr is argspec.defaults[idx - index_field_has_default]:
+                        continue
+                argstr.append("{}={}".format(f, pprint.pformat(attr)))
+            return "imgaug.{}({})".format(classname, ', '.join(argstr))
+        except AssertionError as e:
+            log_once(e.args[0], 'warn')
+            return super(Augmentor, self).__repr__()
 
     __str__ = __repr__
 
 
 class ImageAugmentor(Augmentor):
+    """
+    ImageAugmentor should take images of type uint8 in range [0, 255], or
+    floating point images in range [0, 1] or [0, 255].
+    """
     def augment_coords(self, coords, param):
-        return self._augment_coords(coords, param)
-
-    def _augment_coords(self, coords, param):
         """
         Augment the coordinates given the param.
-        By default, keeps coordinates unchanged.
+        By default, an augmentor keeps coordinates unchanged.
         If a subclass changes coordinates but couldn't implement this method,
         it should ``raise NotImplementedError()``.
 
         Args:
-            coords: Nx2 floating point nparray where each row is (x, y)
+            coords: Nx2 floating point numpy array where each row is (x, y)
         Returns:
             new coords
         """
+        return self._augment_coords(coords, param)
+
+    def _augment_coords(self, coords, param):
         return coords
 
 
@@ -129,7 +140,7 @@ class AugmentorList(ImageAugmentor):
         Args:
             augmentors (list): list of :class:`ImageAugmentor` instance to be applied.
         """
-        self.augs = augmentors
+        self.augmentors = augmentors
         super(AugmentorList, self).__init__()
 
     def _get_augment_params(self, img):
@@ -137,26 +148,28 @@ class AugmentorList(ImageAugmentor):
         raise RuntimeError("Cannot simply get all parameters of a AugmentorList without running the augmentation!")
 
     def _augment_return_params(self, img):
+        check_dtype(img)
         assert img.ndim in [2, 3], img.ndim
 
         prms = []
-        for a in self.augs:
+        for a in self.augmentors:
             img, prm = a._augment_return_params(img)
             prms.append(prm)
         return img, prms
 
     def _augment(self, img, param):
+        check_dtype(img)
         assert img.ndim in [2, 3], img.ndim
-        for aug, prm in zip(self.augs, param):
+        for aug, prm in zip(self.augmentors, param):
             img = aug._augment(img, prm)
         return img
 
     def _augment_coords(self, coords, param):
-        for aug, prm in zip(self.augs, param):
+        for aug, prm in zip(self.augmentors, param):
             coords = aug._augment_coords(coords, prm)
         return coords
 
     def reset_state(self):
         """ Will reset state of each augmentor """
-        for a in self.augs:
+        for a in self.augmentors:
             a.reset_state()

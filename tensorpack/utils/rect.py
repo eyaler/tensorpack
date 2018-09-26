@@ -1,7 +1,6 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # File: rect.py
-# Author: Yuxin Wu <ppwwyyxxc@gmail.com>
+
 
 import numpy as np
 
@@ -34,6 +33,9 @@ class BoxBase(object):
 
     def is_box(self):
         return self.w > 0 and self.h > 0
+
+    def to_list(self):
+        return [self.x1, self.y1, self.x2, self.y2]
 
 
 class IntBox(BoxBase):

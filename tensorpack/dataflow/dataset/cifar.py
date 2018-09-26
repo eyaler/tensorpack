@@ -1,12 +1,12 @@
-#!/usr/bin/env python
-# -*- coding: UTF-8 -*-
+# -*- coding: utf-8 -*-
 # File: cifar.py
-# Author: Yuxin Wu <ppwwyyxx@gmail.com>
+
 #         Yukun Chen <cykustc@gmail.com>
 
 import os
 import pickle
 import numpy as np
+import tarfile
 import six
 from six.moves import range
 
@@ -17,13 +17,12 @@ from ..base import RNGDataFlow
 __all__ = ['Cifar10', 'Cifar100']
 
 
-DATA_URL_CIFAR_10 = 'http://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz'
-DATA_URL_CIFAR_100 = 'http://www.cs.toronto.edu/~kriz/cifar-100-python.tar.gz'
+DATA_URL_CIFAR_10 = ('http://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz', 170498071)
+DATA_URL_CIFAR_100 = ('http://www.cs.toronto.edu/~kriz/cifar-100-python.tar.gz', 169001437)
 
 
 def maybe_download_and_extract(dest_directory, cifar_classnum):
-    """Download and extract the tarball from Alex's website.
-       copied from tensorflow example """
+    """Download and extract the tarball from Alex's website. Copied from tensorflow example """
     assert cifar_classnum == 10 or cifar_classnum == 100
     if cifar_classnum == 10:
         cifar_foldername = 'cifar-10-batches-py'
@@ -34,10 +33,9 @@ def maybe_download_and_extract(dest_directory, cifar_classnum):
         return
     else:
         DATA_URL = DATA_URL_CIFAR_10 if cifar_classnum == 10 else DATA_URL_CIFAR_100
-        download(DATA_URL, dest_directory)
-        filename = DATA_URL.split('/')[-1]
+        filename = DATA_URL[0].split('/')[-1]
         filepath = os.path.join(dest_directory, filename)
-        import tarfile
+        download(DATA_URL[0], dest_directory, expect_size=DATA_URL[1])
         tarfile.open(filepath, 'r:gz').extractall(dest_directory)
 
 
@@ -68,41 +66,53 @@ def read_cifar(filenames, cifar_classnum):
 def get_filenames(dir, cifar_classnum):
     assert cifar_classnum == 10 or cifar_classnum == 100
     if cifar_classnum == 10:
-        filenames = [os.path.join(
+        train_files = [os.path.join(
             dir, 'cifar-10-batches-py', 'data_batch_%d' % i) for i in range(1, 6)]
-        filenames.append(os.path.join(
-            dir, 'cifar-10-batches-py', 'test_batch'))
+        test_files = [os.path.join(
+            dir, 'cifar-10-batches-py', 'test_batch')]
+        meta_file = os.path.join(dir, 'cifar-10-batches-py', 'batches.meta')
     elif cifar_classnum == 100:
-        filenames = [os.path.join(dir, 'cifar-100-python', 'train'),
-                     os.path.join(dir, 'cifar-100-python', 'test')]
-    return filenames
+        train_files = [os.path.join(dir, 'cifar-100-python', 'train')]
+        test_files = [os.path.join(dir, 'cifar-100-python', 'test')]
+        meta_file = os.path.join(dir, 'cifar-100-python', 'meta')
+    return train_files, test_files, meta_file
+
+
+def _parse_meta(filename, cifar_classnum):
+    with open(filename, 'rb') as f:
+        obj = pickle.load(f)
+        return obj['label_names' if cifar_classnum == 10 else 'fine_label_names']
 
 
 class CifarBase(RNGDataFlow):
-    def __init__(self, train_or_test, shuffle=True, dir=None, cifar_classnum=10):
+    def __init__(self, train_or_test, shuffle=None, dir=None, cifar_classnum=10):
         assert train_or_test in ['train', 'test']
         assert cifar_classnum == 10 or cifar_classnum == 100
         self.cifar_classnum = cifar_classnum
         if dir is None:
             dir = get_dataset_path('cifar{}_data'.format(cifar_classnum))
         maybe_download_and_extract(dir, self.cifar_classnum)
-        fnames = get_filenames(dir, cifar_classnum)
+        train_files, test_files, meta_file = get_filenames(dir, cifar_classnum)
         if train_or_test == 'train':
-            self.fs = fnames[:-1]
+            self.fs = train_files
         else:
-            self.fs = [fnames[-1]]
+            self.fs = test_files
         for f in self.fs:
             if not os.path.isfile(f):
                 raise ValueError('Failed to find file: ' + f)
+        self._label_names = _parse_meta(meta_file, cifar_classnum)
         self.train_or_test = train_or_test
         self.data = read_cifar(self.fs, cifar_classnum)
         self.dir = dir
+
+        if shuffle is None:
+            shuffle = train_or_test == 'train'
         self.shuffle = shuffle
 
-    def size(self):
+    def __len__(self):
         return 50000 if self.train_or_test == 'train' else 10000
 
-    def get_data(self):
+    def __iter__(self):
         idxs = np.arange(len(self.data))
         if self.shuffle:
             self.rng.shuffle(idxs)
@@ -112,13 +122,21 @@ class CifarBase(RNGDataFlow):
 
     def get_per_pixel_mean(self):
         """
-        return a mean image of all (train and test) images of size 32x32x3
+        Returns:
+            a mean image of all (train and test) images of size 32x32x3
         """
-        fnames = get_filenames(self.dir, self.cifar_classnum)
-        all_imgs = [x[0] for x in read_cifar(fnames, self.cifar_classnum)]
+        train_files, test_files, _ = get_filenames(self.dir, self.cifar_classnum)
+        all_imgs = [x[0] for x in read_cifar(train_files + test_files, self.cifar_classnum)]
         arr = np.array(all_imgs, dtype='float32')
         mean = np.mean(arr, axis=0)
         return mean
+
+    def get_label_names(self):
+        """
+        Returns:
+            [str]: name of each class.
+        """
+        return self._label_names
 
     def get_per_channel_mean(self):
         """
@@ -134,18 +152,18 @@ class Cifar10(CifarBase):
     image is 32x32x3 in the range [0,255].
     label is an int.
     """
-    def __init__(self, train_or_test, shuffle=True, dir=None):
+    def __init__(self, train_or_test, shuffle=None, dir=None):
         """
         Args:
             train_or_test (str): either 'train' or 'test'.
-            shuffle (bool): shuffle the dataset.
+            shuffle (bool): shuffle the dataset, default to shuffle in training
         """
         super(Cifar10, self).__init__(train_or_test, shuffle, dir, 10)
 
 
 class Cifar100(CifarBase):
     """ Similar to Cifar10"""
-    def __init__(self, train_or_test, shuffle=True, dir=None):
+    def __init__(self, train_or_test, shuffle=None, dir=None):
         super(Cifar100, self).__init__(train_or_test, shuffle, dir, 100)
 
 
@@ -156,7 +174,7 @@ if __name__ == '__main__':
 
     import cv2
     ds.reset_state()
-    for i, dp in enumerate(ds.get_data()):
+    for i, dp in enumerate(ds):
         if i == 100:
             break
         img = dp[0]

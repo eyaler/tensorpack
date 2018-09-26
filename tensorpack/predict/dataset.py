@@ -1,7 +1,6 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # File: dataset.py
-# Author: Yuxin Wu <ppwwyyxxc@gmail.com>
+
 
 from six.moves import range, zip
 from abc import ABCMeta, abstractmethod
@@ -68,11 +67,11 @@ class SimpleDatasetPredictor(DatasetPredictorBase):
     def get_result(self):
         self.dataset.reset_state()
         try:
-            sz = self.dataset.size()
+            sz = len(self.dataset)
         except NotImplementedError:
             sz = 0
         with get_tqdm(total=sz, disable=(sz == 0)) as pbar:
-            for dp in self.dataset.get_data():
+            for dp in self.dataset:
                 res = self.predictor(*dp)
                 yield res
                 pbar.update()
@@ -80,7 +79,7 @@ class SimpleDatasetPredictor(DatasetPredictorBase):
 
 class MultiProcessDatasetPredictor(DatasetPredictorBase):
     """
-    Run prediction in multiprocesses, on either CPU or GPU.
+    Run prediction in multiple processes, on either CPU or GPU.
     Each process fetch datapoints as tasks and run predictions independently.
     """
     # TODO allow unordered
@@ -147,7 +146,7 @@ class MultiProcessDatasetPredictor(DatasetPredictorBase):
 
     def get_result(self):
         try:
-            sz = self.dataset.size()
+            sz = len(self.dataset)
         except NotImplementedError:
             sz = 0
         with get_tqdm(total=sz, disable=(sz == 0)) as pbar:

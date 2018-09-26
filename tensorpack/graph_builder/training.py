@@ -1,20 +1,23 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # File: training.py
 
 from abc import ABCMeta, abstractmethod
 import tensorflow as tf
+import copy
 import six
+import re
+import pprint
 from six.moves import zip, range
+from contextlib import contextmanager
 
 from ..utils import logger
-from ..tfutils.tower import TowerContext
-from ..tfutils.common import get_tf_version_number
+from ..tfutils.tower import TrainTowerContext
 from ..tfutils.gradproc import ScaleGradient
 
 from .utils import (
     LeastLoadedDeviceSetter, override_to_local_variable,
-    allreduce_grads, average_grads)
+    allreduce_grads, aggregate_grads, allreduce_grads_hierarchical,
+    split_grad_list, merge_grad_list, GradientPacker)
 
 
 __all__ = ['GraphBuilder',
@@ -29,6 +32,15 @@ class GraphBuilder(object):
         pass
 
 
+@contextmanager
+def _maybe_reuse_vs(reuse):
+    if reuse:
+        with tf.variable_scope(tf.get_variable_scope(), reuse=True):
+            yield
+    else:
+        yield
+
+
 class DataParallelBuilder(GraphBuilder):
     def __init__(self, towers):
         """
@@ -36,15 +48,11 @@ class DataParallelBuilder(GraphBuilder):
             towers(list[int]): list of GPU ids.
         """
         if len(towers) > 1:
-            logger.info("Training a model of {} towers".format(len(towers)))
-            DataParallelBuilder._check_tf_version()
+            logger.info("[DataParallel] Training a model of {} towers.".format(len(towers)))
+            if not tf.test.is_built_with_cuda():
+                logger.error("[DataParallel] TensorFlow was not built with CUDA support!")
 
         self.towers = towers
-
-    @staticmethod
-    def _check_tf_version():
-        assert get_tf_version_number() >= 1.1, \
-            "TF version {} is too old to run multi GPU training!".format(tf.VERSION)
 
     @staticmethod
     def _check_grad_list(grad_list):
@@ -53,7 +61,19 @@ class DataParallelBuilder(GraphBuilder):
             grad_list: list of list of tuples, shape is Ngpu x Nvar x 2
         """
         nvars = [len(k) for k in grad_list]
-        assert len(set(nvars)) == 1, "Number of gradients from each tower is different! " + str(nvars)
+
+        def basename(x):
+            return re.sub('tower[0-9]+/', '', x.op.name)
+
+        if len(set(nvars)) != 1:
+            names_per_gpu = [set([basename(k[1]) for k in grad_and_vars]) for grad_and_vars in grad_list]
+            inters = copy.copy(names_per_gpu[0])
+            for s in names_per_gpu:
+                inters &= s
+            for s in names_per_gpu:
+                s -= inters
+            logger.error("Unique trainable variables on towers: " + pprint.pformat(names_per_gpu))
+            raise ValueError("Number of gradients from each tower is different! " + str(nvars))
 
     @staticmethod
     def build_on_towers(
@@ -82,12 +102,15 @@ class DataParallelBuilder(GraphBuilder):
         for idx, t in enumerate(towers):
             device = devices[idx] if devices is not None else '/gpu:{}'.format(t)
             usevs = use_vs[idx] if use_vs is not None else False
-            with tf.device(device), TowerContext(
+            reuse = not usevs and idx > 0
+            with tf.device(device), _maybe_reuse_vs(reuse), TrainTowerContext(
                     tower_names[idx],
-                    is_training=True,
-                    index=idx,
-                    vs_name=tower_names[idx] if usevs else ''):
-                logger.info("Building graph for training tower {} on device {}...".format(idx, device))
+                    vs_name=tower_names[idx] if usevs else '',
+                    index=idx, total=len(towers)):
+                if len(str(device)) < 10:   # a device function doesn't have good string description
+                    logger.info("Building graph for training tower {} on device {} ...".format(idx, device))
+                else:
+                    logger.info("Building graph for training tower {} ...".format(idx))
 
                 # When use_vs is True, use LOCAL_VARIABLES,
                 # so these duplicated variables won't be saved by default.
@@ -100,26 +123,26 @@ class SyncMultiGPUParameterServerBuilder(DataParallelBuilder):
     """
     Data-parallel training in 'ParameterServer' mode.
     It builds one tower on each GPU with
-    shared variable scope. It synchronoizes the gradients computed
+    shared variable scope. It synchronizes the gradients computed
     from each tower, averages them and applies to the shared variables.
 
-    See https://www.tensorflow.org/performance/benchmarks for details.
+    It is an equivalent of ``--variable_update=parameter_server`` in
+    `tensorflow/benchmarks <https://github.com/tensorflow/benchmarks>`_.
     """
-    def __init__(self, towers, ps_device=None):
+    def __init__(self, towers, ps_device):
         """
         Args:
             towers(list[int]): list of GPU id
             ps_device (str): either 'gpu' or 'cpu', where variables are stored.
-                Setting to 'cpu' might help when #gpu>=4
         """
         super(SyncMultiGPUParameterServerBuilder, self).__init__(towers)
-        if ps_device is None:
-            ps_device = 'cpu' if len(towers) >= 4 else 'gpu'
         assert ps_device in ['cpu', 'gpu']
         self.ps_device = ps_device
 
     def build(self, get_grad_fn, get_opt_fn):
         """
+        Build the graph, and set self.grads to a list of (g, v), containing the averaged gradients.
+
         Args:
             get_grad_fn (-> [(grad, var)]):
             get_opt_fn (-> tf.train.Optimizer): callable which returns an optimizer
@@ -142,15 +165,15 @@ class SyncMultiGPUParameterServerBuilder(DataParallelBuilder):
         # self.train_op = tf.group(*ops)
         # return
 
-        grads = average_grads(grad_list)
+        self.grads = aggregate_grads(grad_list, colocation=True)
         # grads = grad_list[0]
 
         opt = get_opt_fn()
         if self.ps_device == 'cpu':
             with tf.device('/cpu:0'):
-                train_op = opt.apply_gradients(grads, name='train_op')
+                train_op = opt.apply_gradients(self.grads, name='train_op')
         else:
-            train_op = opt.apply_gradients(grads, name='train_op')
+            train_op = opt.apply_gradients(self.grads, name='train_op')
         return train_op
 
 
@@ -159,13 +182,23 @@ class SyncMultiGPUReplicatedBuilder(DataParallelBuilder):
     Data-parallel training in "replicated" mode,
     where each GPU contains a replicate of the whole model.
     It will build one tower on each GPU under its own variable scope.
-    Each gradient update is averaged across or GPUs through NCCL.
+    Each gradient update is averaged or summed across or GPUs through NCCL.
 
-    See https://www.tensorflow.org/performance/benchmarks for details.
+    It is an equivalent of ``--variable_update=replicated`` in
+    `tensorflow/benchmarks <https://github.com/tensorflow/benchmarks>`_.
     """
+
+    def __init__(self, towers, average, mode):
+        super(SyncMultiGPUReplicatedBuilder, self).__init__(towers)
+        self._average = average
+        assert mode in ['nccl', 'cpu', 'hierarchical'], mode
+        self._mode = mode
 
     def build(self, get_grad_fn, get_opt_fn):
         """
+        Build the graph, and set self.grads to #GPU number of lists of (g, v), containing the
+        all-reduced gradients on each device.
+
         Args:
             get_grad_fn (-> [(grad, var)]):
             get_opt_fn (-> tf.train.Optimizer): callable which returns an optimizer
@@ -181,6 +214,7 @@ class SyncMultiGPUReplicatedBuilder(DataParallelBuilder):
         """
         raw_devices = ['/gpu:{}'.format(k) for k in self.towers]
 
+        # #GPU x #VAR x 2
         grad_list = DataParallelBuilder.build_on_towers(
             self.towers,
             get_grad_fn,
@@ -188,18 +222,57 @@ class SyncMultiGPUReplicatedBuilder(DataParallelBuilder):
             use_vs=[False] + [True] * (len(self.towers) - 1))
 
         DataParallelBuilder._check_grad_list(grad_list)
-        grads = allreduce_grads(grad_list)
+
+        if self._mode == 'hierarchical' and len(raw_devices) < 8:
+            logger.warn("mode='hierarchical' require >= 8 GPUs. Fallback to mode='cpu'.")
+            self._mode = 'cpu'
+
+        dtypes = set([x[0].dtype.base_dtype for x in grad_list[0]])
+        valid_for_nccl = all([k in [tf.float32, tf.float64] for k in dtypes])
+        if self._mode == 'nccl' and not valid_for_nccl:
+            logger.warn("Cannot use mode='nccl' because some gradients have unsupported types. Fallback to mode='cpu'")
+            self._mode = 'cpu'
+
+        if self._mode in ['nccl', 'hierarchical']:
+            all_grads, all_vars = split_grad_list(grad_list)
+
+            if self._mode == 'nccl':
+                all_grads = allreduce_grads(all_grads, average=self._average)  # #gpu x #param
+            else:
+                packer = GradientPacker(len(raw_devices))
+                succ = packer.compute_strategy(all_grads[0])
+                if succ:
+                    packed_grads = packer.pack_all(all_grads, raw_devices)
+                    packed_grads_aggr = allreduce_grads_hierarchical(
+                        packed_grads, raw_devices, average=self._average)
+                    all_grads = packer.unpack_all(packed_grads_aggr, raw_devices)
+                else:
+                    all_grads = allreduce_grads_hierarchical(all_grads, raw_devices, average=self._average)
+
+            self.grads = merge_grad_list(all_grads, all_vars)
+        elif self._mode == 'cpu':
+            agg_grad_and_vars = aggregate_grads(
+                grad_list, colocation=False,
+                devices=['/cpu:0'], average=self._average)    # #param x 2
+            self.grads = []  # #gpu x #param x 2
+            for grad_and_vars in grad_list:   # grad_and_vars: #paramx2
+                # take v from each tower, and g from average.
+                self.grads.append(
+                    [(g, v) for (_, v), (g, _) in zip(grad_and_vars, agg_grad_and_vars)])
 
         train_ops = []
         opt = get_opt_fn()
-        for idx, grad_and_vars in enumerate(grads):
-            with tf.device(raw_devices[idx]):
-                # apply_gradients may create variables. Make them LOCAL_VARIABLES
-                with override_to_local_variable(enable=idx > 0):
-                    train_ops.append(opt.apply_gradients(
-                        grad_and_vars, name='apply_grad_{}'.format(idx)))
+        with tf.name_scope('apply_gradients'):
+            for idx, grad_and_vars in enumerate(self.grads):
+                with tf.device(raw_devices[idx]):
+                    # apply_gradients may create variables. Make them LOCAL_VARIABLES
+                    with override_to_local_variable(enable=idx > 0):
+                        train_ops.append(opt.apply_gradients(
+                            grad_and_vars, name='apply_grad_{}'.format(idx)))
         train_op = tf.group(*train_ops, name='train_op')
-        post_init_op = SyncMultiGPUReplicatedBuilder.get_post_init_ops()
+
+        with tf.name_scope('sync_variables'):
+            post_init_op = SyncMultiGPUReplicatedBuilder.get_post_init_ops()
         return train_op, post_init_op
 
 # Adopt from https://github.com/tensorflow/benchmarks/blob/master/scripts/tf_cnn_benchmarks/variable_mgr.py
@@ -211,24 +284,36 @@ class SyncMultiGPUReplicatedBuilder(DataParallelBuilder):
         # literally all variables, because it's better to sync optimizer-internal variables as well
         all_vars = tf.global_variables() + tf.local_variables()
         var_by_name = dict([(v.name, v) for v in all_vars])
+        trainable_names = set([x.name for x in tf.trainable_variables()])
         post_init_ops = []
+
+        def log_failure(name, reason):
+            if name in trainable_names:
+                msg = "This variable is trainable, so this is probably a fatal error."
+            else:
+                msg = "This variable is non-trainable. Ignore this warning if you know it's OK to leave it out-of-sync."
+            logger.warn("[ReplicatedTrainer] Do not know how to sync variable '{}' across GPUs. "
+                        "Reason: {} ".format(name, reason) + msg)
+
         for v in all_vars:
             if not v.name.startswith('tower'):
                 continue
             if v.name.startswith('tower0'):
-                logger.warn("[SyncMultiGPUReplicatedBuilder] variable "
-                            "{} has prefix 'tower0', this is unexpected.".format(v.name))
+                # in this trainer, the master name doesn't have the towerx/ prefix
+                log_failure(v.name, "Name should not have prefix 'tower0' in this trainer!")
                 continue        # TODO some vars (EMA) may still startswith tower0
-            # in this trainer, the master name doesn't have the towerx/ prefix
+
             split_name = v.name.split('/')
             prefix = split_name[0]
             realname = '/'.join(split_name[1:])
             if prefix in realname:
-                logger.error("[SyncMultiGPUReplicatedBuilder] variable "
-                             "{} has its prefix {} appears multiple times in its name!".format(v.name, prefix))
+                log_failure(v.name, "Prefix {} appears multiple times in its name!".format(prefix))
+                continue
             copy_from = var_by_name.get(realname)
-            assert copy_from is not None, var_by_name.keys()
-            post_init_ops.append(v.assign(copy_from.read_value()))
+            if copy_from is not None:
+                post_init_ops.append(v.assign(copy_from.read_value()))
+            else:
+                log_failure(v.name, "Cannot find {} in the graph!".format(realname))
         logger.info(
             "'sync_variables_from_main_tower' includes {} operations.".format(len(post_init_ops)))
         return tf.group(*post_init_ops, name='sync_variables_from_main_tower')
@@ -262,8 +347,8 @@ class AsyncMultiGPUBuilder(DataParallelBuilder):
         """
         ps_device = 'cpu' if len(self.towers) >= 4 else 'gpu'
 
+        raw_devices = ['/gpu:{}'.format(k) for k in self.towers]
         if ps_device == 'gpu':
-            raw_devices = ['/gpu:{}'.format(k) for k in self.towers]
             devices = [LeastLoadedDeviceSetter(d, raw_devices) for d in raw_devices]
         else:
             devices = [tf.train.replica_device_setter(

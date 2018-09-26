@@ -1,7 +1,6 @@
-#!/usr/bin/env python
-# -*- coding: UTF-8 -*-
+# -*- coding: utf-8 -*-
 # File: param.py
-# Author: Yuxin Wu <ppwwyyxx@gmail.com>
+
 
 import tensorflow as tf
 from abc import abstractmethod, ABCMeta
@@ -112,6 +111,8 @@ class HyperParamSetter(Callback):
     An abstract base callback to set hyperparameters.
     """
 
+    _chief_only = False
+
     def __init__(self, param):
         """
         Args:
@@ -123,7 +124,8 @@ class HyperParamSetter(Callback):
             param = GraphVarParam(param)
         assert isinstance(param, HyperParam), type(param)
         self.param = param
-        self.last_value = None
+        self._last_value = None
+        self._last_epoch_set = -1
 
     def _setup_graph(self):
         self.param.setup_graph()
@@ -139,10 +141,13 @@ class HyperParamSetter(Callback):
             set, or return None to do nothing.
         """
         ret = self._get_value_to_set()
-        if ret is not None and ret != self.last_value:
-            logger.info("After epoch {}, {} will change to {:.8f}".format(
-                self.epoch_num, self.param.readable_name, ret))
-        self.last_value = ret
+        if ret is not None and ret != self._last_value:
+            if self.epoch_num != self._last_epoch_set:
+                # Print this message at most once every epoch
+                logger.info("[HyperParamSetter] At global_step={}, {} will change to {:.8f}".format(
+                    self.global_step, self.param.readable_name, ret))
+            self._last_epoch_set = self.epoch_num
+        self._last_value = ret
         return ret
 
     @abstractmethod
@@ -211,16 +216,22 @@ class ScheduledHyperParamSetter(HyperParamSetter):
     Set hyperparameters by a predefined epoch-based schedule.
     """
 
-    def __init__(self, param, schedule, interp=None):
+    def __init__(self, param, schedule, interp=None, step_based=False):
         """
         Args:
             param: same as in :class:`HyperParamSetter`.
             schedule (list): with the format ``[(epoch1, val1), (epoch2, val2), (epoch3, val3)]``.
                 Each ``(ep, val)`` pair means to set the param
-                to "val" __after__ the completion of epoch `ep`.
+                to "val" **after** the completion of epoch `ep`.
                 If ep == 0, the value will be set before the first epoch
-                (by default the first is epoch 1).
-            interp: None: no interpolation. 'linear': linear interpolation
+                (because by default the first is epoch 1).
+                The epoch numbers have to be increasing.
+            interp (str or None): Either None or 'linear'.
+                If None, the parameter will only be set when the specific epoch or steps
+                is reached exactly. If 'linear', perform linear interpolation (but no extrapolation)
+                every time this callback is triggered.
+            step_based (bool): interpret ``schedule`` as (step, value) instead
+                of (epoch, value).
 
         Example:
             .. code-block:: python
@@ -233,27 +244,34 @@ class ScheduledHyperParamSetter(HyperParamSetter):
         if interp is not None:
             assert interp == 'linear'
         self.interp = interp
+        self._step = step_based
         super(ScheduledHyperParamSetter, self).__init__(param)
 
     def _get_value_to_set(self):
-        if self.interp is None:
-            for e, v in self.schedule:
-                if e == self.epoch_num:
-                    return v
+        refnum = self.global_step if self._step else self.epoch_num
+        laste, lastv = None, None
+        for e, v in self.schedule:
+            if e == refnum:
+                return v    # meet the exact boundary, return directly
+            if e > refnum:
+                break
+            laste, lastv = e, v
+        if laste is None or laste == e:
+            # hasn't reached the first scheduled point, or reached the end of all scheduled points
             return None
-        else:
-            laste, lastv = None, None
-            for e, v in self.schedule:
-                if e == self.epoch_num:
-                    return v
-                if e > self.epoch_num:
-                    break
-                laste, lastv = e, v
-            if laste is None or laste == e:
-                # hasn't reached the first scheduled point, or reached the end of all scheduled points
-                return None
-            v = (self.epoch_num - laste) * 1. / (e - laste) * (v - lastv) + lastv
-            return v
+        if self.interp is None:
+            # If no interpolation, nothing to do.
+            return None
+        v = (refnum - laste) * 1. / (e - laste) * (v - lastv) + lastv
+        return v
+
+    def _trigger_epoch(self):
+        if not self._step:
+            self.trigger()
+
+    def _trigger_step(self):
+        if self._step:
+            self.trigger()
 
 
 class HyperParamSetterWithFunc(HyperParamSetter):
@@ -321,7 +339,13 @@ class StatMonitorParamSetter(HyperParamSetter):
         self.last_changed_epoch = 0
 
     def _get_value_to_set(self):
-        hist = self.trainer.monitors.get_history(self.stat_name)
+        try:
+            hist = self.trainer.monitors.get_history(self.stat_name)
+        except KeyError:
+            logger.warn(
+                "[StatMonitorParamSetter] Key {} not found in monitor history! Ignore it.".format(self.stat_name))
+            return None
+
         if len(hist) < self.last_k + 1 or \
                 self.epoch_num - self.last_changed_epoch < self.last_k:
             return None
@@ -339,5 +363,5 @@ class StatMonitorParamSetter(HyperParamSetter):
         self.last_changed_epoch = self.epoch_num
         logger.info(
             "[StatMonitorParamSetter] Triggered, history of {}: ".format(
-                self.stat_name) + ','.join(map(str, hist)))
+                self.stat_name) + ','.join([str(round(x, 3)) for x in hist]))
         return self.value_func(self.get_current_value())
